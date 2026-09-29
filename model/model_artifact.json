@@ -108,6 +108,8 @@
   "extra_cols": [
     "opp_goalie_effect"
   ],
+  "alpha_l2": 0.03,
+  "half_life_days": 200,
   "period_shares": {
     "ANA": {
       "1": 0.29398663697104677,
@@ -2955,16 +2957,6 @@
       "rating_gpg": 0.0
     }
   ],
-  "meta": {
-    "fitted_at": "2026-09-29T18:18:11.272678",
-    "trained_through": "2026-06-14",
-    "n_games": 7945,
-    "goalies_on": true,
-    "alpha_l2": 0.03,
-    "half_life_days": 200,
-    "home_ot_win": 0.5181378476420798,
-    "mean_goals": 3.099219170705439,
-    "k_shots": 2570.5508514373737,
-    "shots_per_game": 29.70547514159849
-  }
+  "fitted_at": "2026-09-29T18:21:15.119700",
+  "trained_through_date": "2026-06-14"
 }
