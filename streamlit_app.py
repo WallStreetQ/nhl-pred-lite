@@ -98,8 +98,7 @@ def predict_game(coefs, home_team, away_team, total_line, spread_line, home_rest
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
-if not check_password():
-    st.stop()
+
 
 coefs = load_coefficients()
 
