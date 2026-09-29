@@ -26,31 +26,6 @@ COEFFICIENTS_PATH = Path(__file__).parent / "model_coefficients.json"
 
 
 # ---------------------------------------------------------------------------
-# Password gate
-# ---------------------------------------------------------------------------
-def check_password():
-    """Simple shared-password gate. Password is set via Streamlit secrets, never
-    committed to the repo (see secrets.toml.example)."""
-
-    def password_entered():
-        if st.session_state.get("password_input") == st.secrets.get("app_password"):
-            st.session_state["password_correct"] = True
-            del st.session_state["password_input"]
-        else:
-            st.session_state["password_correct"] = False
-
-    if st.session_state.get("password_correct"):
-        return True
-
-    st.text_input(
-        "Password", type="password", key="password_input", on_change=password_entered
-    )
-    if "password_correct" in st.session_state and not st.session_state["password_correct"]:
-        st.error("Incorrect password.")
-    return False
-
-
-# ---------------------------------------------------------------------------
 # Model loading (cached so it only reads the file once per deploy, not per click)
 # ---------------------------------------------------------------------------
 @st.cache_data
