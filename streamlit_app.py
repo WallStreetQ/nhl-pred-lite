@@ -243,7 +243,7 @@ with tab_slate:
             pf = max(gr["p_home_win"], 1 - gr["p_home_win"])
             rows.append({"Date": g["date"], "Game": f"{g['away']} @ {g['home']}",
                          "Back-to-back": ", ".join(t for t, on in ((g["away"], g.get("away_b2b")), (g["home"], g.get("home_b2b"))) if on),
-                         "Favourite": fav, "Win %": pct(pf), "Fair ML": american(pf),
+                         "Model pick": fav, "Pick win %": pct(pf), "Fair ML": american(pf),
                          "Exp. total": f"{gr['exp_total']:.2f}", "Over 6.5": pct(gr["total"]["over"]),
                          "OT/SO": pct(gr["p_tie_reg"])})
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
@@ -305,10 +305,14 @@ with tab_track:
             P3 = done[["p_home_reg", "p_tie_reg", "p_away_reg"]].values
             t1, t2, t3, t4 = st.columns(4)
             t1.metric("Games settled", f"{len(done):,}")
-            t2.metric("Favourite won", pct(fav_right))
+            t2.metric("Model's moneyline pick won", pct(fav_right),
+                      help="Share of settled games where the team the model gave a 50%+ win chance actually won "
+                           "(including OT/SO). This is the model's pick, not the betting market's favourite.")
             t3.metric("Moneyline Brier", f"{((p - y) ** 2).mean():.4f}",
-                      delta=f"{((p - y) ** 2).mean() - ((y.mean() - y) ** 2).mean():+.4f} vs coin-flip baseline",
-                      delta_color="inverse", help="Lower is better. 0.25 = always saying 50%.")
+                      delta=f"{((p - y) ** 2).mean() - ((y.mean() - y) ** 2).mean():+.4f} vs constant home-win rate",
+                      delta_color="inverse",
+                      help="Lower is better. 0.25 = always saying 50%. The comparison is against always predicting "
+                           "the home-win rate seen in these games; negative means the model did better.")
             t4.metric("3-way log-loss", f"{-np.log(P3[np.arange(len(done)), reg]).mean():.3f}",
                       help="Lower is better. ~1.04-1.05 is what the backtest achieved.")
             if len(done) >= 40:
@@ -319,10 +323,14 @@ with tab_track:
                 st.markdown("**Calibration (home win probability)**")
                 st.dataframe(cal.round(3), hide_index=True, width="stretch")
             recent = done.tail(15).iloc[::-1]
+            pick_home = recent["p_home_win"] >= 0.5
+            home_won = recent["home_score"] > recent["away_score"]
             st.markdown("**Latest results**")
             st.dataframe(pd.DataFrame({
                 "Date": recent["date"], "Game": recent["away"] + " @ " + recent["home"],
-                "Home win %": recent["p_home_win"].map(pct),
+                "Model pick": np.where(pick_home, recent["home"], recent["away"]),
+                "Pick win %": np.maximum(recent["p_home_win"], 1 - recent["p_home_win"]).map(pct),
+                "Pick won": np.where(pick_home == home_won, "✓", "✗"),
                 "Score": recent["away_score"].astype(int).astype(str) + "-" + recent["home_score"].astype(int).astype(str),
                 "OT/SO": np.where(recent["home_reg"] == recent["away_reg"], "yes", "")}), hide_index=True, width="stretch")
             st.caption("Predictions are logged by refresh.py before each game with each team's usual goalie mix, so this "
