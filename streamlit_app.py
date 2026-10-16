@@ -274,9 +274,15 @@ with tab_board:
                                      pred.goalie_spec(g["away"], None, b2b=ab), home_b2b=hb, away_b2b=ab)
             except ValueError:
                 continue
-            when = et_time(go[PRIMARY].get("commence_time") or g.get("start_utc")) or g["date"]
+            start_iso = go[PRIMARY].get("commence_time") or g.get("start_utc")
+            when = et_time(start_iso) or g["date"]
+            started = bool(start_iso) and pd.to_datetime(start_iso, utc=True) <= pd.Timestamp.now(tz="UTC")
             for e in er:
-                rows.append({"Time (ET)": when, "Game": f"{g['away']} @ {g['home']}", "Market": e["market"],
+                rows.append({"_date": g["date"], "_started": started,
+                             "_start": pd.to_datetime(start_iso, utc=True) if start_iso
+                             else pd.Timestamp(g["date"], tz="America/New_York").tz_convert("UTC"),
+                             "Time (ET)": when + (" (started)" if started else ""),
+                             "Game": f"{g['away']} @ {g['home']}", "Market": e["market"],
                              "Bet": e["label"], BOOK: f"{e['price']:+d}", "Model": e["model_cond"],
                              f"{BOOK} fair": e["fair"], "Edge": e["edge"], "EV / $100": 100 * e["ev"],
                              f"{REF_BOOK} fair": e["ref_fair"], "_hold": e["hold"],
@@ -285,14 +291,23 @@ with tab_board:
             st.info(f"No {BOOK} prices for the upcoming games yet. Books often post NHL lines the day before.")
         else:
             bd = pd.DataFrame(rows)
-            f1, f2, f3 = st.columns([1, 2, 1])
+            days = sorted(bd["_date"].unique())
+            upcoming_days = [d for d in days if not bd.loc[bd["_date"] == d, "_started"].all()]
+            day_opts = days + ["All days"]
+            default_day = upcoming_days[0] if upcoming_days else days[-1]
+            f0, f1, f2, f3 = st.columns([1.2, 1, 2, 1])
+            day = f0.selectbox("Day", day_opts, index=day_opts.index(default_day),
+                               format_func=lambda d: d if d == "All days" else
+                               pd.Timestamp(d).strftime("%a %b ") + str(pd.Timestamp(d).day))
             thr = f1.slider("Flag edges of at least (pts)", 0.0, 10.0, 3.0, 0.5) / 100
             mkts = f2.multiselect("Markets", ["Moneyline", "Puck line", "Total"], ["Moneyline", "Puck line", "Total"])
             only = f3.toggle("Flagged only", value=True)
+            if day != "All days":
+                bd = bd[bd["_date"] == day]
             show = bd[bd["Market"].isin(mkts)]
             if only:
                 show = show[show["Edge"] >= thr]
-            show = show.sort_values("Edge", ascending=False)
+            show = show.sort_values(["_start", "Edge"], ascending=[True, False])     # game time, then biggest edge
             n_flag = int((bd["Edge"] >= thr).sum())
             st.markdown(f"**{n_flag} flagged** out of {len(bd)} priced sides across {bd['Game'].nunique()} games · "
                         f"average {BOOK} margin {100 * bd['_hold'].mean():.1f}%")
@@ -304,7 +319,7 @@ with tab_board:
                 st.info("Nothing clears the threshold right now. That's normal on many nights - the market is "
                         "usually close to the model.")
             else:
-                out = show.drop(columns=["_hold", "_src"]).copy()
+                out = show.drop(columns=["_hold", "_src", "_date", "_started", "_start"]).copy()
                 for c in ("Model", f"{BOOK} fair", f"{REF_BOOK} fair"):
                     out[c] = out[c].map(pct)
                 out["Edge"] = out["Edge"].map(lambda x: f"{100 * x:+.1f} pts")
