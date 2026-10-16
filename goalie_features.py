@@ -13,6 +13,11 @@ Design in one paragraph
   beta is LEARNED: beta ~ 1 means the rating is trustworthy at face value, beta < 1 means
   it is still too noisy, beta ~ 0 means the goalie adds nothing beyond the team ratings.
 
+GSAx ratings (section 2b) are the same idea built on goals saved above expected instead of sv%:
+  sv% treats every shot as equally hard, so a goalie behind a leaky defence looks worse than he is.
+  GSAx = expected goals faced (from nhl_xg.py) - goals allowed, per unblocked attempt, shrunk toward
+  league average and expressed in the same goals-per-game units, so the two ratings can be blended.
+
 Also fixes two issues in the current notebook fit (see review): the ridge penalty is applied
 ONLY to team/opponent terms (not intercept / home / goalie), and shrinkage is toward the
 league average rather than toward the alphabetical reference team.
@@ -173,6 +178,96 @@ def attach_opp_goalie_effect(long_df, starters, mean_goals=3.1, col="opp_goalie_
     out = long_df.merge(m[["game_id", "opponent", "opp_rating_gpg"]], on=["game_id", "opponent"], how="left")
     out[col] = (out["opp_rating_gpg"].fillna(0.0) / mean_goals)
     return out.drop(columns=["opp_rating_gpg"])
+
+
+# ----------------------------------------------------------------------------------------
+# 2b. Leak-free GSAx ratings (goals saved above expected, from nhl_xg.py's goalie_xg table)
+# ----------------------------------------------------------------------------------------
+
+def merge_goalie_xg(gk, goalie_xg):
+    """Adds per goalie-game xG columns to the goalie table (game_goalies rows):
+        attempts   unblocked, non-empty-net, non-penalty-shot attempts faced
+        gsax       expected goals faced - goals allowed on those attempts (positive = good)
+        xg_var     sum of xg*(1-xg): the sampling variance of gsax (used for the shrinkage prior)
+        has_xg     True if this game has shot data
+    Games with no shot data get zeros, so they simply don't move a goalie's GSAx rating."""
+    x = goalie_xg.rename(columns={"goalie_id": "player_id"}).copy()
+    x["player_id"] = x["player_id"].astype("int64")
+    if "xg_var" not in x.columns:          # goalie_xg from before xg_var existed: binomial upper bound
+        p = (x["goals"].sum() / max(x["attempts"].sum(), 1))
+        x["xg_var"] = x["attempts"] * p * (1 - p)
+    x = x.groupby(["game_id", "player_id"], as_index=False)[["attempts", "gsax", "xg_var"]].sum()
+    out = gk.drop(columns=[c for c in ("attempts", "gsax", "xg_var", "has_xg") if c in gk.columns])
+    out = out.merge(x, on=["game_id", "player_id"], how="left")
+    xg_games = set(x["game_id"])
+    out["has_xg"] = out["game_id"].isin(xg_games)
+    for c in ("attempts", "gsax", "xg_var"):
+        out[c] = out[c].fillna(0.0)
+    return out
+
+
+def estimate_gsax_prior(gk, min_attempts=600, k_bounds=(500.0, 30000.0)):
+    """Shrinkage strength for GSAx, in unblocked attempts:  k = sigma^2 / tau^2
+        sigma^2 = sampling variance of GSAx per attempt (from the shots' xg*(1-xg))
+        tau^2   = variance of TRUE GSAx-per-attempt talent, from the year-over-year covariance of the
+                  same goalie's season GSAx/attempt (noise is independent across seasons, so it cancels).
+    Needs gk with merge_goalie_xg columns. Returns (k, tau, n_pairs)."""
+    s = gk[gk["has_xg"]].groupby(["player_id", "season"]).agg(
+        a=("attempts", "sum"), g=("gsax", "sum"), v=("xg_var", "sum")).reset_index()
+    s = s[s["a"] >= min_attempts].copy()
+    if s.empty:
+        return float(k_bounds[1]), 0.0, 0
+    lg = s["g"].sum() / s["a"].sum()
+    s["r"] = s["g"] / s["a"] - lg
+    sigma2 = float(s["v"].sum() / s["a"].sum())
+    nxt = s.assign(season=s["season"] + 10001)
+    pairs = s.merge(nxt, on=["player_id", "season"], suffixes=("", "_prev"))
+    if len(pairs) >= 15:
+        w = pairs["a"] * pairs["a_prev"] / (pairs["a"] + pairs["a_prev"])
+        tau2 = float(np.average(pairs["r"] * pairs["r_prev"], weights=w))
+    else:
+        tau2 = float(np.average(s["r"] ** 2, weights=s["a"]) - sigma2 / s["a"].mean())
+    tau2 = max(tau2, 1e-10)
+    k = float(np.clip(sigma2 / tau2, *k_bounds))
+    return k, float(np.sqrt(tau2)), len(pairs)
+
+
+def build_gsax_ratings(gk, k_attempts=3000.0, attempts_per_game=None, prior_offset=0.0):
+    """GSAx version of build_goalie_ratings. Adds, each from games strictly earlier:
+        prior_attempts      unblocked attempts faced before this game
+        rating_gsax_pa      shrunk GSAx per attempt minus league GSAx per attempt (positive = better)
+        rating_gpg          same, in goals/game vs average goalie at league-average attempt volume
+        prior_shots         = prior_attempts (so starter_table works unchanged)
+    League GSAx/attempt is subtracted (from earlier dates only) because the xG model is calibrated to
+    all seasons, so a season with more scoring than average shows up as negative GSAx for everyone.
+    prior_offset (GSAx per attempt, usually <= 0) sets the prior mean for goalies with little history."""
+    gk = gk.sort_values(["game_date", "game_id"]).reset_index(drop=True).copy()
+    if attempts_per_game is None:
+        tg = gk[gk["has_xg"]].groupby(["game_id", "team"])["attempts"].sum()
+        attempts_per_game = float(tg.mean()) if len(tg) else 45.0
+
+    daily = gk.groupby("game_date")[["gsax", "attempts"]].sum().sort_index()
+    cum = daily.cumsum().shift(1)
+    lg = (cum["gsax"] / cum["attempts"].replace(0, np.nan)).fillna(0.0)
+    gk["lg_gsax_pa"] = gk["game_date"].map(lg).fillna(0.0)
+
+    by = gk.groupby("player_id")
+    gk["prior_gsax"] = by["gsax"].cumsum() - gk["gsax"]
+    gk["prior_attempts"] = by["attempts"].cumsum() - gk["attempts"]
+    excess = gk["prior_gsax"] - gk["lg_gsax_pa"] * gk["prior_attempts"]
+    gk["rating_gsax_pa"] = (excess + k_attempts * prior_offset) / (gk["prior_attempts"] + k_attempts)
+    gk["rating_gpg"] = gk["rating_gsax_pa"] * attempts_per_game
+    gk["prior_shots"] = gk["prior_attempts"]
+    return gk
+
+
+def gsax_season_table(gk, k_attempts, attempts_per_game):
+    """Current (all-history) GSAx rating per goalie, for the artifact's goalie table."""
+    x = gk[gk["has_xg"]]
+    lg = x["gsax"].sum() / max(x["attempts"].sum(), 1)
+    t = x.groupby("player_id").agg(attempts=("attempts", "sum"), gsax=("gsax", "sum"))
+    t["gsax_rating_gpg"] = (t["gsax"] - lg * t["attempts"]) / (t["attempts"] + k_attempts) * attempts_per_game
+    return t
 
 
 # ----------------------------------------------------------------------------------------
