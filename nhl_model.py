@@ -50,8 +50,8 @@ DEFAULT_HALF_LIFE = 200      # days
 DEFAULT_ALPHA = 0.03         # ridge strength on team ratings (per unit of current-season weight)
 DEFAULT_CARRYOVER = 0.7      # weight multiplier per season boundary crossed (1 = off); walk-forward tuned
 DEFAULT_SHOT_BLEND = 0.25    # share of team ratings from the shots model (0 = off); walk-forward tuned
-DEFAULT_XG_BLEND = 0.0       # share of team ratings from the xG model (0 = off); tune with tune_model.py
-DEFAULT_GOALIE_XG_BLEND = 0.25  # share of goalie ratings from GSAx instead of sv% (0 = sv% only); tune it
+DEFAULT_XG_BLEND = 0.25      # share of team ratings from the xG model (0 = off); walk-forward tuned on totals
+DEFAULT_GOALIE_XG_BLEND = 0.0  # share of goalie ratings from GSAx instead of sv% (0 = sv% only); tune it
 TEAM_ALIASES = {"ARI": "UTA"}
 MAX_GOALS = 12
 MARGIN_BUCKETS = 5           # |margin| 0,1,2,3,4+
@@ -122,6 +122,25 @@ class GameDist:
 
     def btts(self):
         return float(self.F[(self._hf > 0) & (self._af > 0)].sum())
+
+
+def american_to_decimal(us):
+    """American odds -> decimal odds (+150 -> 2.50, -120 -> 1.833). Invalid -> nan."""
+    try:
+        us = float(us)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(us) or abs(us) < 100:
+        return float("nan")
+    return 1 + (us / 100 if us > 0 else 100 / -us)
+
+
+def devig(prices):
+    """Fair (no-margin) probabilities from a full set of American prices for one market, by proportional
+    normalisation of the implied probabilities. Also returns the book's margin (hold)."""
+    imp = np.array([1 / american_to_decimal(p) for p in prices], float)
+    tot = imp.sum()
+    return imp / tot, float(tot - 1)
 
 
 def btts_prob(lam_a, lam_b):
@@ -329,13 +348,24 @@ def load_data(data_dir="data", playoff_weight=0.5, use_goalies="auto", min_goali
         log(f"goalies: ON ({coverage:.1%} coverage) | k={k_shots:,.0f} shots, talent SD {tau:.4f} sv%")
 
     # ---- GSAx goalie ratings (alternative to sv%; needs data/goalie_xg from nhl_xg.py) ----
-    gsax_on, k_att, apg, gsax_coverage = False, None, None, 0.0
+    gsax_on, k_att, apg, gsax_coverage, gsax_reason = False, None, None, 0.0, None
     gx = read_table(data_dir, "goalie_xg", required=False) if goalies_on else None
-    if gx is not None and not gx.empty:
+    if not goalies_on:
+        gsax_reason = "goalies are off (the save% goalie data has to be on first - see the 'goalies:' line above)"
+    elif gx is None:
+        gsax_reason = f"no goalie_xg.parquet/.csv in {Path(data_dir).resolve()}"
+    elif gx.empty:
+        gsax_reason = ("goalie_xg exists but is empty - no shots had a goalie in net. Check data/shots: "
+                       "is the goalie_id column filled?")
+    else:
         gk_all = merge_goalie_xg(gk_all, gx)
         st_rows = gk_all[gk_all["starter"]]
         gsax_coverage = float(st_rows["has_xg"].mean()) if len(st_rows) else 0.0
-        if gsax_coverage > 0:
+        if gsax_coverage == 0:
+            gsax_reason = (f"goalie_xg has {gx['game_id'].nunique():,} games but none match game_goalies "
+                           f"(goalie_xg game_id e.g. {gx['game_id'].iloc[0]!r}, "
+                           f"game_goalies e.g. {gk_all['game_id'].iloc[0]!r})")
+        else:
             k_att, tau_pa, n_pairs = estimate_gsax_prior(gk_all)
             apg = float(gk_all[gk_all["has_xg"]].groupby(["game_id", "team"])["attempts"].sum().mean())
             rated_x = build_gsax_ratings(gk_all, k_attempts=k_att, attempts_per_game=apg)
@@ -344,11 +374,13 @@ def load_data(data_dir="data", playoff_weight=0.5, use_goalies="auto", min_goali
             gsax_on = True
             log(f"goalie GSAx: {gsax_coverage:.1%} of starts have shot data | k={k_att:,.0f} attempts, "
                 f"talent SD {tau_pa * apg:.3f} goals/game ({n_pairs} repeat goalie-seasons)")
+    if gsax_reason:
+        log(f"goalie GSAx: OFF - {gsax_reason}")
 
     return {"games": games, "fin": fin, "long": long_base, "periods": periods, "gk": gk_all,
             "teams": teams, "mean_goals": mean_goals, "home_ot_win": home_ot_win,
             "goalies_on": goalies_on, "coverage": coverage, "k_shots": k_shots, "spg": spg,
-            "xg_coverage": xg_coverage, "gsax_on": gsax_on, "gsax_coverage": gsax_coverage,
+            "xg_coverage": xg_coverage, "gsax_on": gsax_on, "gsax_coverage": gsax_coverage, "gsax_reason": gsax_reason,
             "k_attempts": k_att, "attempts_per_game": apg}
 
 
@@ -696,6 +728,7 @@ class Predictor:
         self.beta = np.array(art["beta"])
         self.period_shares = {t: {int(k): v for k, v in s.items()} for t, s in art["period_shares"].items()}
         self.slate = art.get("slate", [])
+        self.odds = art.get("odds") or {}
         gb = art.get("goalies")
         self.goalies_on = bool(gb)
         if self.goalies_on:
@@ -805,6 +838,60 @@ class Predictor:
             "btts": gd.btts(), "periods": periods, "goalie_info": info,
             "margin_pmf": {"margin": d[keep].tolist(), "p": mp[keep].tolist()},
         }
+
+    # ---------- sportsbook comparison ----------
+    def game_odds(self, game_id):
+        """Latest prices for one upcoming game from the artifact: {book_key: {market: {...}}} or {}."""
+        return (self.odds.get("games") or {}).get(str(game_id), {})
+
+    def edge_board(self, home, away, game_odds, home_goalie=None, away_goalie=None, home_b2b=False,
+                   away_b2b=False, primary=None, reference=None):
+        """Model vs book at the PRIMARY book's exact lines. One row per side of each priced market:
+            market, side, label, line, price, model_p (win), push, model_cond (win | no push),
+            fair (book no-vig, given no push), edge = model_cond - fair, ev (per 1 unit staked, push = refund),
+            hold (book margin), ref_fair (reference book no-vig at the SAME line, else None)."""
+        primary = primary or self.odds.get("primary", "hardrockbet_fl")
+        reference = reference or self.odds.get("reference", "pinnacle")
+        book, ref = game_odds.get(primary) or {}, game_odds.get(reference) or {}
+        if not book:
+            return []
+        lh, la, _ = self.lambdas(home, away, home_goalie, away_goalie, home_b2b, away_b2b)
+        gd = GameDist(lh, la, self.home_ot_win, self.grid_w)
+        home, away = self.resolve(home), self.resolve(away)
+        specs = []                                   # (market, [(side, label, p_win, push, price)], ref sides)
+        m = book.get("h2h")
+        if m and "home" in m and "away" in m:
+            specs.append(("Moneyline", [("home", f"{home} ML", gd.p_home_win, 0.0, m["home"]),
+                                        ("away", f"{away} ML", 1 - gd.p_home_win, 0.0, m["away"])],
+                          ref.get("h2h"), None))
+        m = book.get("spreads")
+        if m and "home" in m and "away" in m and "point" in m:
+            s = gd.spread(m["point"])
+            specs.append(("Puck line", [("home", f"{home} {m['point']:+g}", s["cover"], s["push"], m["home"]),
+                                        ("away", f"{away} {-m['point']:+g}", s["fail"], s["push"], m["away"])],
+                          ref.get("spreads"), m["point"]))
+        m = book.get("totals")
+        if m and "over" in m and "under" in m and "point" in m:
+            t = gd.total(m["point"])
+            specs.append(("Total", [("over", f"Over {m['point']:g}", t["over"], t["push"], m["over"]),
+                                    ("under", f"Under {m['point']:g}", t["under"], t["push"], m["under"])],
+                          ref.get("totals"), m["point"]))
+        rows = []
+        for market, sides, rm, point in specs:
+            fair, hold = devig([sd[4] for sd in sides])
+            ref_fair = [None] * len(sides)
+            keys = [sd[0] for sd in sides]
+            if rm and all(k in rm for k in keys) and (point is None or abs(rm.get("point", np.nan) - point) < 1e-9):
+                ref_fair = list(devig([rm[k] for k in keys])[0])
+            for (side, label, p, push, price), f, rf in zip(sides, fair, ref_fair):
+                dec = american_to_decimal(price)
+                cond = p / (1 - push) if push < 1 else 0.0
+                rows.append({"market": market, "side": side, "label": label, "line": point, "price": int(price),
+                             "dec": dec, "model_p": float(p), "push": float(push), "model_cond": float(cond),
+                             "fair": float(f), "edge": float(cond - f),
+                             "ev": float(p * (dec - 1) - max(0.0, 1 - p - push)), "hold": hold,
+                             "ref_fair": None if rf is None else float(rf)})
+        return rows
 
     # ---------- display helpers ----------
     def team_ratings(self):

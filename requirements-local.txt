@@ -1,0 +1,6 @@
+# For running everything on your own machine (fetching data, refreshing, notebook, local app).
+# Streamlit Cloud only uses requirements.txt.
+-r requirements.txt
+pyarrow>=14
+requests>=2.28
+jupyter

@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "fitted_at": "2026-10-16T14:14:00",
+  "seasons": [
+    20202021,
+    20212022,
+    20222023,
+    20232024,
+    20242025,
+    20252026
+  ],
+  "n_shots": 678986,
+  "features": [
+    "intercept",
+    "dist",
+    "dist_gt_10",
+    "dist_gt_20",
+    "dist_gt_35",
+    "dist_gt_55",
+    "angle",
+    "angle_sq",
+    "type_snap",
+    "type_slap",
+    "type_backhand",
+    "type_tip-in",
+    "type_deflected",
+    "type_wrap-around",
+    "type_other",
+    "pp",
+    "sh",
+    "rebound",
+    "rush",
+    "rebound_x_angle"
+  ],
+  "beta": [
+    -0.308926,
+    -1.174718,
+    0.861056,
+    -0.276022,
+    -0.145181,
+    0.310186,
+    -0.305271,
+    -0.258104,
+    0.367262,
+    0.545836,
+    -0.38262,
+    -0.640002,
+    -0.47742,
+    -0.674087,
+    -0.197722,
+    0.284216,
+    0.213579,
+    -0.085441,
+    0.020396,
+    0.303374
+  ],
+  "dist_knots": [
+    10,
+    20,
+    35,
+    55
+  ],
+  "shot_types": [
+    "snap",
+    "slap",
+    "backhand",
+    "tip-in",
+    "deflected",
+    "wrap-around"
+  ],
+  "empty_net_beta": [
+    1.949551,
+    -0.228029
+  ],
+  "penalty_shot_rate": 0.27896995708154504,
+  "rink_bias": {}
+}

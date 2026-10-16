@@ -1,0 +1,9 @@
+data/
+odds_api_key.txt
+__pycache__/
+*.pyc
+.venv/
+.ipynb_checkpoints/
+.streamlit/secrets.toml
+model/Troubleshooting.py
+nhl_prediction_model.ipynb

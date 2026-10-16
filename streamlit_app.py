@@ -1,7 +1,7 @@
 """
 streamlit_app.py - NHL game predictor
 
-Reads only model/model_artifact.json and model/prediction_log.csv (written by refresh.py).
+Reads only model/model_artifact.json, model/prediction_log.csv and model/edge_log.csv (written by refresh.py).
 No raw data, no API calls.  Run locally:  streamlit run streamlit_app.py
 """
 
@@ -16,9 +16,11 @@ from nhl_model import Predictor, load_artifact
 ROOT = Path(__file__).parent
 ART_PATH = ROOT / "model" / "model_artifact.json"
 LOG_PATH = ROOT / "model" / "prediction_log.csv"
+EDGE_PATH = ROOT / "model" / "edge_log.csv"
 USUAL = "Unknown - use team's usual mix"
 CUSTOM = "Custom matchup"
 EARLY_GP = 10
+STALE_HOURS = 6
 
 st.set_page_config(page_title="NHL Game Predictor", page_icon="🏒", layout="wide")
 
@@ -31,6 +33,11 @@ def get_predictor(mtime: float) -> Predictor:      # mtime in the key => reload 
 @st.cache_data(show_spinner=False)
 def get_log(mtime: float) -> pd.DataFrame:
     return pd.read_csv(LOG_PATH)
+
+
+@st.cache_data(show_spinner=False)
+def get_edges(mtime: float) -> pd.DataFrame:
+    return pd.read_csv(EDGE_PATH)
 
 
 # ------------------------------------------------------------------ odds helpers
@@ -53,6 +60,15 @@ def to_decimal(us):
     if us is None or pd.isna(us) or abs(us) < 100:
         return np.nan
     return 1 + (us / 100 if us > 0 else 100 / -us)
+
+
+def et_time(iso, fmt="%a %I:%M %p"):
+    t = pd.to_datetime(iso, utc=True, errors="coerce")
+    return "" if pd.isna(t) else t.tz_convert("America/New_York").strftime(fmt).replace(" 0", " ")
+
+
+def is_true(s):
+    return s.astype(str).str.lower().isin(["true", "1"])
 
 
 # ------------------------------------------------------------------ market table
@@ -80,6 +96,27 @@ def build_markets(r, home, away):
                  (g, f"{name} under {t['line']:g}", t["under"], t["push"])]
     rows += [("btts", "Both teams score: yes", r["btts"], 0.0), ("btts", "Both teams score: no", 1 - r["btts"], 0.0)]
     return pd.DataFrame(rows, columns=["group", "Market", "p", "push"])
+
+
+def prefill_odds(mk, book, total_line, home_spread):
+    """Hard Rock prices for the moneyline, puck line and game total rows (only where the line matches)."""
+    pre = [None] * len(mk)
+    if not book:
+        return pre
+    groups = mk["group"].tolist()
+    def put(group, prices):
+        idx = [i for i, g in enumerate(groups) if g == group]
+        for i, p in zip(idx, prices):
+            pre[i] = p
+    if "h2h" in book:
+        put("ml", [book["h2h"].get("home"), book["h2h"].get("away")])
+    sp = book.get("spreads")
+    if sp and abs(sp.get("point", 99) - home_spread) < 1e-9:
+        put("pl", [sp.get("home"), sp.get("away")])
+    tt = book.get("totals")
+    if tt and abs(tt.get("point", 99) - total_line) < 1e-9:
+        put("tot", [tt.get("over"), tt.get("under")])
+    return pre
 
 
 def price_markets(mk, odds):
@@ -113,10 +150,16 @@ except ValueError as e:
     st.stop()
 meta = pred.meta
 gp = meta.get("season_gp", {})
+odds = pred.odds
+PRIMARY = odds.get("primary", "hardrockbet_fl")
+REFERENCE = odds.get("reference", "pinnacle")
+BOOK = (odds.get("books") or {}).get(PRIMARY, "Hard Rock Bet")
+REF_BOOK = (odds.get("books") or {}).get(REFERENCE, "Pinnacle")
 
 st.title("🏒 NHL Game Predictor")
 st.caption(f"Model trained through **{meta['trained_through']}** · {meta['n_games']:,} games · "
-           f"goalie data **{'ON' if pred.goalies_on else 'OFF'}**")
+           f"goalie data **{'ON' if pred.goalies_on else 'OFF'}**"
+           + (f" · {BOOK} odds as of **{et_time(odds['pulled_at'])} ET**" if odds.get("pulled_at") else ""))
 
 # ------------------------------------------------------------------ game picker
 teams = pred.active_teams
@@ -142,6 +185,11 @@ if home == away:
     st.warning("Pick two different teams.")
     st.stop()
 
+# Hard Rock prices for this game, only when the teams still match the scheduled game
+book = {}
+if sg and home == sg["home"] and away == sg["away"]:
+    book = pred.game_odds(sg["game_id"]).get(PRIMARY, {})
+
 early = [t for t in (home, away) if gp.get(t, 99) < EARLY_GP]
 if early:
     st.info(f"Early season: {', '.join(f'{t} ({gp.get(t, 0)} GP)' for t in early)}. Ratings still lean on last season, "
@@ -149,10 +197,15 @@ if early:
 
 with st.expander("Lines", expanded=True):
     l1, l2, l3, l4 = st.columns(4)
-    total_line = l1.number_input("Game total", 3.0, 10.0, 6.5, 0.5)
-    home_spread = l2.number_input(f"{home} spread", -3.5, 3.5, -1.5, 0.5, help="-1.5 = home lays 1.5 goals")
+    def_total = float(book.get("totals", {}).get("point", 6.5))
+    def_spread = float(book.get("spreads", {}).get("point", -1.5))
+    total_line = l1.number_input("Game total", 3.0, 10.0, def_total, 0.5, key=f"tl_{k}_{def_total}")
+    home_spread = l2.number_input(f"{home} spread", -3.5, 3.5, def_spread, 0.5, help="-1.5 = home lays 1.5 goals",
+                                  key=f"hs_{k}_{home}_{def_spread}")
     home_tt = l3.number_input(f"{home} team total", 0.5, 6.5, 2.5, 0.5, key=f"htt_{home}")
     away_tt = l4.number_input(f"{away} team total", 0.5, 6.5, 2.5, 0.5, key=f"att_{away}")
+    if book:
+        st.caption(f"Game total and puck line default to {BOOK}'s current lines.")
 
 # ------------------------------------------------------------------ goalies
 home_gid = away_gid = None
@@ -160,7 +213,8 @@ home_conf = away_conf = 1.0
 if pred.goalies_on:
     st.subheader("Goalies")
     st.caption("Pick a starter once he's confirmed (typically morning of the game). 'Unknown' uses each team's "
-               "recent starter mix, shifted toward the backup on the second night of a back-to-back.")
+               "recent starter mix, shifted toward the backup on the second night of a back-to-back. "
+               "The value check on the Game markets tab updates with your pick.")
     gc1, gc2 = st.columns(2)
     for col, team, side in ((gc1, away, "away"), (gc2, home, "home")):
         gl = {USUAL: None}
@@ -191,19 +245,89 @@ m3.metric("Expected total", f"{r['exp_total']:.2f}")
 m4.metric(f"{home} win probability", pct(r["p_home_win"]), help="Includes overtime / shootout")
 m5.metric("Goes to OT/SO", pct(r["p_tie_reg"]))
 
-tabs = st.tabs(["Game markets", "Today's slate", "Period markets", "Goalie impact", "Track record", "Model info"])
-tab_game, tab_slate, tab_period, tab_goalie, tab_track, tab_model = tabs
+tabs = st.tabs(["Edges board", "Game markets", "Today's slate", "Period markets", "Goalie impact", "Track record",
+                "Model info"])
+tab_board, tab_game, tab_slate, tab_period, tab_goalie, tab_track, tab_model = tabs
+
+with tab_board:
+    if not odds.get("games"):
+        st.info("No sportsbook odds in this model file yet. Set an Odds API key (see nhl_odds.py) and run "
+                "`python refresh.py --skip-fetch --push`.")
+    else:
+        age_h = (pd.Timestamp.now(tz="UTC") - pd.to_datetime(odds["pulled_at"], utc=True)).total_seconds() / 3600
+        if age_h > STALE_HOURS:
+            st.warning(f"These prices are {age_h:.0f} hours old. Lines move; check {BOOK} before acting, or run "
+                       "`python refresh.py --skip-fetch --push` for fresh odds.")
+        rows = []
+        for g in slate:
+            go = pred.game_odds(g["game_id"])
+            if not go.get(PRIMARY):
+                continue
+            hb, ab = g.get("home_b2b", False), g.get("away_b2b", False)
+            try:
+                er = pred.edge_board(g["home"], g["away"], go, pred.goalie_spec(g["home"], None, b2b=hb),
+                                     pred.goalie_spec(g["away"], None, b2b=ab), home_b2b=hb, away_b2b=ab)
+            except ValueError:
+                continue
+            when = et_time(go[PRIMARY].get("commence_time") or g.get("start_utc")) or g["date"]
+            for e in er:
+                rows.append({"Time (ET)": when, "Game": f"{g['away']} @ {g['home']}", "Market": e["market"],
+                             "Bet": e["label"], BOOK: f"{e['price']:+d}", "Model": e["model_cond"],
+                             f"{BOOK} fair": e["fair"], "Edge": e["edge"], "EV / $100": 100 * e["ev"],
+                             f"{REF_BOOK} fair": e["ref_fair"], "_hold": e["hold"],
+                             "_src": go[PRIMARY].get("source", PRIMARY)})
+        if not rows:
+            st.info(f"No {BOOK} prices for the upcoming games yet. Books often post NHL lines the day before.")
+        else:
+            bd = pd.DataFrame(rows)
+            f1, f2, f3 = st.columns([1, 2, 1])
+            thr = f1.slider("Flag edges of at least (pts)", 0.0, 10.0, 3.0, 0.5) / 100
+            mkts = f2.multiselect("Markets", ["Moneyline", "Puck line", "Total"], ["Moneyline", "Puck line", "Total"])
+            only = f3.toggle("Flagged only", value=True)
+            show = bd[bd["Market"].isin(mkts)]
+            if only:
+                show = show[show["Edge"] >= thr]
+            show = show.sort_values("Edge", ascending=False)
+            n_flag = int((bd["Edge"] >= thr).sum())
+            st.markdown(f"**{n_flag} flagged** out of {len(bd)} priced sides across {bd['Game'].nunique()} games · "
+                        f"average {BOOK} margin {100 * bd['_hold'].mean():.1f}%")
+            main_feed = bd.loc[bd["_src"] == "hardrockbet", "Game"].nunique()
+            if main_feed:
+                st.caption(f"{main_feed} of {bd['Game'].nunique()} games use Hard Rock's main odds feed because the "
+                           "Florida feed didn't carry them. Prices are usually the same, but confirm in the app before acting.")
+            if show.empty:
+                st.info("Nothing clears the threshold right now. That's normal on many nights - the market is "
+                        "usually close to the model.")
+            else:
+                out = show.drop(columns=["_hold", "_src"]).copy()
+                for c in ("Model", f"{BOOK} fair", f"{REF_BOOK} fair"):
+                    out[c] = out[c].map(pct)
+                out["Edge"] = out["Edge"].map(lambda x: f"{100 * x:+.1f} pts")
+                out["EV / $100"] = out["EV / $100"].map(lambda x: f"{x:+.2f}")
+                st.dataframe(out, hide_index=True, width="stretch")
+        st.caption(
+            f"Edge = model probability minus {BOOK}'s probability with its margin removed (both exclude pushes on "
+            f"whole-number lines). EV / $100 is at {BOOK}'s actual price. {REF_BOOK} fair is the sharp market's view at "
+            f"the same line: if it sides with {BOOK} rather than the model, be sceptical of the edge. The board uses each "
+            "team's usual goalie mix - pick the game at the top and set confirmed starters to re-price it on the Game "
+            "markets tab. The Track record tab shows whether flagged edges have held up.")
 
 with tab_game:
     mk = build_markets(r, home, away)
-    st.caption("Type your sportsbook's American odds (e.g. -115, +140) in **Your odds**. Price both sides of a market "
-               "and the book's margin is removed before comparing. On whole-number lines the push chance is shown separately "
-               "and fair odds exclude it, matching how books grade a push as a refund.")
-    edit_key = f"odds_{home}_{away}_{total_line}_{home_spread}_{home_tt}_{away_tt}"
+    pre = prefill_odds(mk, book, total_line, home_spread)
+    if any(p is not None for p in pre):
+        st.caption(f"**Your odds** is prefilled with {BOOK} prices as of {et_time(odds.get('pulled_at'))} ET "
+                   "(moneyline, puck line and game total at the book's line). Overwrite with the price you see. "
+                   "Price both sides of a market and the book's margin is removed before comparing.")
+    else:
+        st.caption("Type your sportsbook's American odds (e.g. -115, +140) in **Your odds**. Price both sides of a market "
+                   "and the book's margin is removed before comparing. On whole-number lines the push chance is shown "
+                   "separately and fair odds exclude it, matching how books grade a push as a refund.")
+    edit_key = f"odds_{home}_{away}_{total_line}_{home_spread}_{home_tt}_{away_tt}_{odds.get('pulled_at', '')}"
     shown = pd.DataFrame({"Market": mk["Market"], "Model": mk["p"].map(pct),
                           "Push": mk["push"].map(lambda x: pct(x) if x > 1e-9 else ""),
                           "Fair odds": (mk["p"] / (1 - mk["push"])).map(lambda p: fair(p) if p > 0 else "-"),
-                          "Your odds": [None] * len(mk)})
+                          "Your odds": pd.array(pre, dtype="Int64")})
     edited = st.data_editor(shown, hide_index=True, width="stretch", key=edit_key,
                             disabled=["Market", "Model", "Push", "Fair odds"],
                             column_config={"Your odds": st.column_config.NumberColumn(
@@ -286,15 +410,65 @@ with tab_goalie:
             st.markdown("**Impact of the goalie selection**" + (" (includes the back-to-back adjustment)" if (home_b2b or away_b2b) and home_gid is None and away_gid is None else ""))
             st.dataframe(imp, hide_index=True, width="stretch")
         beta = meta.get("goalie_beta")
+        gxb = meta.get("goalie_xg_blend_used") or 0
+        basis = ("save % only" if not gxb else
+                 f"{100 * (1 - gxb):.0f}% save % / {100 * gxb:.0f}% goals saved above expected")
         if beta is not None:
             st.caption(f"Fitted goalie coefficient: {beta:+.2f} (near -1 = ratings trusted at face value; near 0 = goalies add little). "
-                       "Ratings use save % only, shrunk toward league average.")
+                       f"Ratings use {basis}, shrunk toward league average.")
 
 with tab_track:
     bt = meta.get("backtest")
+    if EDGE_PATH.exists():
+        el = get_edges(EDGE_PATH.stat().st_mtime)
+        fl = el[is_true(el["flag"])] if "flag" in el else el.iloc[0:0]
+        done = fl[fl["result"].notna()].copy() if "result" in fl else fl.iloc[0:0]
+        st.markdown(f"**Flagged edges at {BOOK}** (logged before each game; 1 unit at the price when first flagged)")
+        if done.empty:
+            st.info(f"{len(fl)} edges flagged so far; none settled yet. Results fill in on the next refresh after each game.")
+        else:
+            done["profit"] = pd.to_numeric(done["profit"], errors="coerce")
+            done["clv"] = pd.to_numeric(done["clv"], errors="coerce")
+            rec = done["result"].value_counts()
+            staked = int((done["result"] != "push").sum())
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Flagged edges settled", f"{len(done):,}")
+            e2.metric("Record (W-L-P)", f"{rec.get('win', 0)}-{rec.get('loss', 0)}-{rec.get('push', 0)}")
+            e3.metric("Units", f"{done['profit'].sum():+.2f}",
+                      delta=f"{100 * done['profit'].sum() / max(staked, 1):+.1f}% ROI", delta_color="normal")
+            clv = done["clv"].dropna()
+            e4.metric("Beat the closing line", pct((clv > 0).mean()) if len(clv) else "-",
+                      delta=f"{100 * clv.mean():+.2f} pts avg" if len(clv) else None, delta_color="normal",
+                      help=f"Closing line value: the closing no-vig probability ({REF_BOOK} when available, else {BOOK}) "
+                           "minus the break-even probability of the price you'd have taken. Positive and consistent "
+                           "is the earliest sign of a real edge - it needs far fewer games than win/loss.")
+            by = done.groupby("market").agg(Flags=("result", "size"), Wins=("result", lambda s: (s == "win").sum()),
+                                            Units=("profit", "sum"), Avg_CLV=("clv", "mean")).reset_index()
+            by["Units"] = by["Units"].map(lambda x: f"{x:+.2f}")
+            by["Avg_CLV"] = by["Avg_CLV"].map(lambda x: "-" if pd.isna(x) else f"{100 * x:+.2f} pts")
+            st.dataframe(by.rename(columns={"market": "Market", "Avg_CLV": "Avg CLV"}), hide_index=True, width="stretch")
+            allset = el[el["result"].notna()] if "result" in el else el.iloc[0:0]
+            if len(allset):
+                ap = pd.to_numeric(allset["profit"], errors="coerce")
+                st.caption(f"For comparison, every logged side (flagged or not): {len(allset):,} settled, "
+                           f"{100 * ap.sum() / max(int((allset['result'] != 'push').sum()), 1):+.1f}% ROI - roughly "
+                           f"what betting without the model costs at {BOOK}'s margin.")
+            recent = done.sort_values("date").tail(15).iloc[::-1]
+            st.dataframe(pd.DataFrame({
+                "Date": recent["date"], "Game": recent["away"] + " @ " + recent["home"], "Bet": recent["open_label"],
+                "Price": pd.to_numeric(recent["open_price"]).map(lambda x: f"{x:+.0f}"),
+                "Edge": pd.to_numeric(recent["open_edge"]).map(lambda x: f"{100 * x:+.1f} pts"),
+                "Close": pd.to_numeric(recent["close_price"]).map(lambda x: f"{x:+.0f}"),
+                "CLV": recent["clv"].map(lambda x: "-" if pd.isna(x) else f"{100 * x:+.1f} pts"),
+                "Result": recent["result"], "Final": recent["final"]}), hide_index=True, width="stretch")
+            if len(done) < 200:
+                st.caption(f"Only {len(done)} settled flags: win/loss and units are still mostly luck at this sample size. "
+                           "Closing line value is the more reliable early read.")
+        st.divider()
     if LOG_PATH.exists():
         lg = get_log(LOG_PATH.stat().st_mtime)
         done = lg[lg["home_score"].notna()].copy() if "home_score" in lg else lg.iloc[0:0]
+        st.markdown("**Prediction accuracy**")
         if done.empty:
             st.info(f"{len(lg)} games logged so far; none settled yet. Results fill in on the next refresh after each game.")
         else:
@@ -364,6 +538,8 @@ with tab_model:
             show = leaders.copy()
             show["sv_pct"] = show["sv_pct"].map(lambda x: f"{x:.3f}")
             show["rating_gpg"] = show["rating_gpg"].round(2)
+            if "gsax" in show:
+                show["gsax"] = show["gsax"].round(1)
             st.dataframe(show, width="stretch", height=420)
         else:
             st.markdown("**Goalie ratings** - not available until goalie data is included.")
@@ -371,7 +547,7 @@ with tab_model:
     st.caption(
         f"Recency half-life {meta['half_life_days']:g} days · ridge α {meta['alpha_l2']:g} "
         f"(effective {meta.get('alpha_eff', meta['alpha_l2']):.3f}) · past-season weight {meta.get('carryover', 1):g} · "
-        f"shots blend {meta.get('shot_blend', 0):.0%}"
+        f"shots blend {meta.get('shot_blend', 0):.0%} · xG blend {meta.get('xg_blend_used', 0):.0%}"
         + (f" · teams on a back-to-back score {100 * (np.exp(b2b) - 1):+.1f}%" if b2b is not None else "")
         + f" · fitted {meta['fitted_at']}. The model predicts regulation goals; ties are settled by one OT/SO goal and the "
         "score grid is calibrated to real overtime and empty-net frequencies. For information and entertainment only - not betting advice.")
