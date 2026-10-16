@@ -25,8 +25,13 @@ STALE_HOURS = 6
 st.set_page_config(page_title="NHL Game Predictor", page_icon="🏒", layout="wide")
 
 
+MODEL_CODE = ROOT / "nhl_model.py"
+
+
 @st.cache_resource(show_spinner=False)
-def get_predictor(mtime: float) -> Predictor:      # mtime in the key => reload if the file changes
+def get_predictor(mtime: float, code_mtime: float = 0.0) -> Predictor:
+    # Both file times are in the cache key, so a new model file OR new model code rebuilds the predictor
+    # (otherwise a code-only deploy keeps serving an object built from the old class).
     return Predictor(load_artifact(ART_PATH))
 
 
@@ -144,7 +149,7 @@ if not ART_PATH.exists():
     st.error("model/model_artifact.json not found. Run `python refresh.py` locally, then commit and push the model folder.")
     st.stop()
 try:
-    pred = get_predictor(ART_PATH.stat().st_mtime)
+    pred = get_predictor(ART_PATH.stat().st_mtime, MODEL_CODE.stat().st_mtime if MODEL_CODE.exists() else 0.0)
 except ValueError as e:
     st.error(str(e))
     st.stop()
