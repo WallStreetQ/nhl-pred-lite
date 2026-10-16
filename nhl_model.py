@@ -21,6 +21,13 @@ Model (v3)
     new season instead of carrying last year's roster forward unchanged.
   * Rest: back-to-back flags for the team and its opponent.
   * Shots: team ratings can be blended with a shots-based model (shots stabilise faster than goals).
+  * Expected goals: team ratings can also be blended with an xG-based model (regulation xG, no empty-net
+    shots, from data/game_xg made by nhl_xg.py). Ratings = (1 - shot_blend - xg_blend) x goals model
+    + shot_blend x shots model + xg_blend x xG model. xg_blend defaults to 0 (off) until tune_model.py
+    shows it helps; if data/game_xg is missing the xG part is skipped and its weight stays on goals.
+  * Goalies: the opposing goalie's rating can come from save% (default), from goals saved above expected
+    (GSAx, data/goalie_xg from nhl_xg.py), or a mix: rating = (1 - goalie_xg_blend) x sv% rating
+    + goalie_xg_blend x GSAx rating. Both are leak-free and in goals/game vs an average goalie.
   * ARI history is merged into UTA (same roster moved).
 
 Depends on goalie_features.py (fitter + goalie ratings).
@@ -35,17 +42,21 @@ import pandas as pd
 from scipy.stats import poisson, skellam
 
 from goalie_features import (PoissonTeamModel, estimate_prior_strength, build_goalie_ratings,
-                             starter_table, attach_opp_goalie_effect, expected_goalie_effect)
+                             starter_table, attach_opp_goalie_effect, expected_goalie_effect,
+                             merge_goalie_xg, estimate_gsax_prior, build_gsax_ratings, gsax_season_table)
 
 ARTIFACT_VERSION = 3
 DEFAULT_HALF_LIFE = 200      # days
 DEFAULT_ALPHA = 0.03         # ridge strength on team ratings (per unit of current-season weight)
 DEFAULT_CARRYOVER = 0.7      # weight multiplier per season boundary crossed (1 = off); walk-forward tuned
 DEFAULT_SHOT_BLEND = 0.25    # share of team ratings from the shots model (0 = off); walk-forward tuned
+DEFAULT_XG_BLEND = 0.0       # share of team ratings from the xG model (0 = off); tune with tune_model.py
+DEFAULT_GOALIE_XG_BLEND = 0.25  # share of goalie ratings from GSAx instead of sv% (0 = sv% only); tune it
 TEAM_ALIASES = {"ARI": "UTA"}
 MAX_GOALS = 12
 MARGIN_BUCKETS = 5           # |margin| 0,1,2,3,4+
 REST_COLS = ["b2b", "opp_b2b"]
+MIN_SIDE_ROWS = 200          # a shots/xG side model needs this many team-games, else its weight stays on goals
 
 
 # ======================================================================================
@@ -293,6 +304,19 @@ def load_data(data_dir="data", playoff_weight=0.5, use_goalies="auto", min_goali
     else:
         long_base["shots"] = np.nan
 
+    # expected goals for = regulation xG, empty-net shots excluded (from nhl_xg.py; NaN where missing)
+    long_base["xg"] = np.nan
+    xg_coverage = 0.0
+    gx = read_table(data_dir, "game_xg", required=False)
+    if gx is not None and not gx.empty:
+        gx = gx.copy()
+        gx["team"] = _alias(gx["team"])
+        xcol = "xgf_reg" if "xgf_reg" in gx.columns else "xgf"
+        xf = gx.drop_duplicates(["game_id", "team"], keep="last").set_index(["game_id", "team"])[xcol]
+        long_base["xg"] = xf.reindex(list(zip(long_base["game_id"], long_base["team"]))).values.astype(float)
+        xg_coverage = float(long_base["xg"].notna().mean())
+        log(f"xG: {xg_coverage:.1%} of team-games have expected goals ({xcol})")
+
     teams = sorted(set(long_base["team"]) | set(long_base["opponent"]))
     mean_goals = float(long_base.loc[long_base["type_weight"] == 1.0, "goals"].mean())
 
@@ -304,9 +328,39 @@ def load_data(data_dir="data", playoff_weight=0.5, use_goalies="auto", min_goali
         long_base = attach_opp_goalie_effect(long_base, starter_table(rated), mean_goals=mean_goals)
         log(f"goalies: ON ({coverage:.1%} coverage) | k={k_shots:,.0f} shots, talent SD {tau:.4f} sv%")
 
+    # ---- GSAx goalie ratings (alternative to sv%; needs data/goalie_xg from nhl_xg.py) ----
+    gsax_on, k_att, apg, gsax_coverage = False, None, None, 0.0
+    gx = read_table(data_dir, "goalie_xg", required=False) if goalies_on else None
+    if gx is not None and not gx.empty:
+        gk_all = merge_goalie_xg(gk_all, gx)
+        st_rows = gk_all[gk_all["starter"]]
+        gsax_coverage = float(st_rows["has_xg"].mean()) if len(st_rows) else 0.0
+        if gsax_coverage > 0:
+            k_att, tau_pa, n_pairs = estimate_gsax_prior(gk_all)
+            apg = float(gk_all[gk_all["has_xg"]].groupby(["game_id", "team"])["attempts"].sum().mean())
+            rated_x = build_gsax_ratings(gk_all, k_attempts=k_att, attempts_per_game=apg)
+            long_base = attach_opp_goalie_effect(long_base, starter_table(rated_x), mean_goals=mean_goals,
+                                                 col="opp_goalie_effect_gsax")
+            gsax_on = True
+            log(f"goalie GSAx: {gsax_coverage:.1%} of starts have shot data | k={k_att:,.0f} attempts, "
+                f"talent SD {tau_pa * apg:.3f} goals/game ({n_pairs} repeat goalie-seasons)")
+
     return {"games": games, "fin": fin, "long": long_base, "periods": periods, "gk": gk_all,
             "teams": teams, "mean_goals": mean_goals, "home_ot_win": home_ot_win,
-            "goalies_on": goalies_on, "coverage": coverage, "k_shots": k_shots, "spg": spg}
+            "goalies_on": goalies_on, "coverage": coverage, "k_shots": k_shots, "spg": spg,
+            "xg_coverage": xg_coverage, "gsax_on": gsax_on, "gsax_coverage": gsax_coverage,
+            "k_attempts": k_att, "attempts_per_game": apg}
+
+
+def goalie_mix(long_df, goalie_xg_blend):
+    """opp_goalie_effect = (1 - w) x sv% effect + w x GSAx effect. No-op when w = 0 or GSAx is unavailable."""
+    w = float(goalie_xg_blend or 0)
+    if w < 0 or w > 1:
+        raise ValueError(f"goalie_xg_blend ({w}) must be between 0 and 1")
+    if w == 0 or "opp_goalie_effect_gsax" not in long_df.columns or "opp_goalie_effect" not in long_df.columns:
+        return long_df
+    return long_df.assign(opp_goalie_effect=(1 - w) * long_df["opp_goalie_effect"]
+                          + w * long_df["opp_goalie_effect_gsax"])
 
 
 # ======================================================================================
@@ -321,9 +375,14 @@ def _weights(df, as_of, half_life, carryover):
 
 
 def fit_ratings(train, teams, as_of, half_life=DEFAULT_HALF_LIFE, alpha=DEFAULT_ALPHA,
-                carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, goalies=False):
-    """Fit goals (and optionally shots) models on `train` (rows strictly before as_of).
+                carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, goalies=False,
+                xg_blend=DEFAULT_XG_BLEND):
+    """Fit the goals model, plus optional shots and xG models, on `train` (rows strictly before as_of).
+    Team ratings = (1 - shot_blend - xg_blend) x goals + shot_blend x shots + xg_blend x xG.
+    A side model without enough data is skipped and its weight stays on the goals model.
     Returns (beta, extra_cols, alpha_eff, diagnostics)."""
+    if shot_blend < 0 or xg_blend < 0 or shot_blend + xg_blend > 1 + 1e-9:
+        raise ValueError(f"shot_blend ({shot_blend}) and xg_blend ({xg_blend}) must be >= 0 and sum to <= 1")
     base, w = _weights(train, as_of, half_life, carryover)
     # The fit is normalised by sum(w). Scaling alpha by sum(base)/sum(w) keeps the penalty fixed relative
     # to the undiscounted data, so discounting old seasons genuinely shrinks ratings toward average.
@@ -333,14 +392,21 @@ def fit_ratings(train, teams, as_of, half_life=DEFAULT_HALF_LIFE, alpha=DEFAULT_
     gm = PoissonTeamModel(teams, alpha=alpha_eff, extra_cols=extra).fit(df)
     beta = gm.beta.copy()
     T = len(teams)
+    r = slice(1, 1 + 2 * T)                      # attack + defense ratings
     diag = {"home_coef": float(gm.coef("is_home")), "b2b_coef": float(gm.coef("b2b")),
             "opp_b2b_coef": float(gm.coef("opp_b2b")),
-            "goalie_beta": float(gm.coef("opp_goalie_effect")) if goalies else None}
-    if shot_blend > 0:
-        s = df.dropna(subset=["shots"])
-        if len(s) > 200:
-            sm = PoissonTeamModel(teams, alpha=alpha_eff, extra_cols=REST_COLS).fit(s.assign(goals=s["shots"]))
-            beta[1:1 + 2 * T] = (1 - shot_blend) * gm.beta[1:1 + 2 * T] + shot_blend * sm.beta[1:1 + 2 * T]
+            "goalie_beta": float(gm.coef("opp_goalie_effect")) if goalies else None,
+            "blend_used": {}}
+    for col, wgt in (("shots", shot_blend), ("xg", xg_blend)):
+        if wgt <= 0 or col not in df.columns:
+            continue
+        s = df.dropna(subset=[col])
+        if len(s) <= MIN_SIDE_ROWS:
+            continue
+        # side models carry no goalie term: shot volume and shot quality don't depend on who is in net
+        sm = PoissonTeamModel(teams, alpha=alpha_eff, extra_cols=REST_COLS).fit(s.assign(goals=s[col].astype(float)))
+        beta[r] += wgt * (sm.beta[r] - gm.beta[r])
+        diag["blend_used"][col] = wgt
     return beta, extra, alpha_eff, diag
 
 
@@ -402,11 +468,16 @@ def b2b_same_goalie_rate(gk):
 # ======================================================================================
 
 def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFAULT_ALPHA,
-                   carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND,
+                   carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, xg_blend=DEFAULT_XG_BLEND,
+                   goalie_xg_blend=DEFAULT_GOALIE_XG_BLEND,
                    playoff_weight=0.5, use_goalies="auto", min_goalie_coverage=0.95,
                    pool_starts=25, as_of=None, upcoming=None, log=print):
     D = load_data(data_dir, playoff_weight, use_goalies, min_goalie_coverage, log)
-    fin, long_base, teams = D["fin"], D["long"], D["teams"]
+    fin, teams = D["fin"], D["teams"]
+    gxb = goalie_xg_blend if D["gsax_on"] else 0.0
+    if goalie_xg_blend > 0 and not D["gsax_on"]:
+        log(f"  goalie_xg_blend={goalie_xg_blend:g} requested but no usable GSAx data (data/goalie_xg) - using sv% only")
+    long_base = goalie_mix(D["long"], gxb)
     last_date = fin["game_date"].max()
     # "as of" = later of the last game and today: in the off-season the new season already counts as current
     as_of = pd.Timestamp(as_of) if as_of is not None else max(last_date, pd.Timestamp(date.today()))
@@ -415,10 +486,14 @@ def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFA
     log(f"games: {len(fin):,} through {last_date.date()} | {len(active_teams)} active teams | as of {as_of.date()}")
 
     beta, extra, alpha_eff, diag = fit_ratings(long_base, teams, as_of, half_life_days, alpha,
-                                               carryover, shot_blend, D["goalies_on"])
+                                               carryover, shot_blend, D["goalies_on"], xg_blend)
+    used = diag["blend_used"]
     log(f"fit: home {diag['home_coef']:+.3f} | b2b {diag['b2b_coef']:+.3f} | opp b2b {diag['opp_b2b_coef']:+.3f}"
         + (f" | goalie beta {diag['goalie_beta']:+.2f}" if D["goalies_on"] else "")
-        + f" | effective alpha {alpha_eff:.3f}")
+        + f" | effective alpha {alpha_eff:.3f}"
+        + f" | blend: shots {used.get('shots', 0):g}, xG {used.get('xg', 0):g}")
+    if xg_blend > 0 and "xg" not in used:
+        log(f"  xg_blend={xg_blend:g} requested but no usable xG data (data/game_xg) - its weight stayed on goals")
 
     gids = fin["game_id"].values
     lh, la = _home_away_lams(beta, teams, extra, long_base, gids)
@@ -441,8 +516,17 @@ def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFA
         t = g.groupby("player_id").agg(name=("name", "last"), team=("team", "last"), last_game=("game_date", "max"),
                                        starts=("starter", "sum"), saves=("saves", "sum"), shots=("shots_against", "sum"))
         t["sv_pct"] = t["saves"] / t["shots"].replace(0, np.nan)
-        t["rating_gpg"] = ((t["saves"] + k_shots * lg) / (t["shots"] + k_shots) - lg) * spg
-        table = t.reset_index()[["player_id", "name", "team", "last_game", "starts", "sv_pct", "rating_gpg"]]
+        t["sv_rating_gpg"] = ((t["saves"] + k_shots * lg) / (t["shots"] + k_shots) - lg) * spg
+        cols = ["player_id", "name", "team", "last_game", "starts", "sv_pct", "rating_gpg", "sv_rating_gpg"]
+        if D["gsax_on"]:
+            gx_t = gsax_season_table(g, D["k_attempts"], D["attempts_per_game"])
+            t = t.join(gx_t[["gsax", "gsax_rating_gpg"]], how="left")
+            t[["gsax", "gsax_rating_gpg"]] = t[["gsax", "gsax_rating_gpg"]].fillna(0.0)
+            cols += ["gsax", "gsax_rating_gpg"]
+            t["rating_gpg"] = (1 - gxb) * t["sv_rating_gpg"] + gxb * t["gsax_rating_gpg"]
+        else:
+            t["rating_gpg"] = t["sv_rating_gpg"]
+        table = t.reset_index()[cols]
         table["last_game"] = table["last_game"].dt.strftime("%Y-%m-%d")
         st = g[g["starter"]].drop_duplicates(["game_id", "team"])
         pools, last_starter = {}, {}
@@ -465,6 +549,9 @@ def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFA
         "meta": {"fitted_at": datetime.now().isoformat(timespec="seconds"), "trained_through": str(last_date.date()),
                  "as_of": str(as_of.date()), "n_games": int(len(fin)), "half_life_days": half_life_days,
                  "alpha_l2": alpha, "alpha_eff": alpha_eff, "carryover": carryover, "shot_blend": shot_blend,
+                 "xg_blend": xg_blend, "xg_blend_used": used.get("xg", 0.0), "xg_coverage": D["xg_coverage"],
+                 "goalie_xg_blend": goalie_xg_blend, "goalie_xg_blend_used": gxb,
+                 "gsax_coverage": D["gsax_coverage"], "gsax_k_attempts": D["k_attempts"],
                  "goalies_on": D["goalies_on"], "goalie_coverage": D["coverage"], "goalie_beta": diag["goalie_beta"],
                  "home_coef": diag["home_coef"], "b2b_coef": diag["b2b_coef"], "opp_b2b_coef": diag["opp_b2b_coef"],
                  "period_share_K": share_K, "active_teams": active_teams, "season_gp": gp,
@@ -498,14 +585,19 @@ def build_slate(upcoming, last_played, last_date):
 # ======================================================================================
 
 def walk_forward(data_dir="data", n_seasons=3, half_life_days=DEFAULT_HALF_LIFE, alpha=DEFAULT_ALPHA,
-                 carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, goalies="auto",
-                 margin_cal=True, rest=True, refit_days=30, D=None, log=print):
+                 carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, xg_blend=DEFAULT_XG_BLEND,
+                 goalie_xg_blend=DEFAULT_GOALIE_XG_BLEND,
+                 goalies="auto", margin_cal=True, rest=True, refit_days=30, D=None, log=print):
     """Refit every `refit_days` using only earlier games and predict the next block. Scores regular-season
-    games in the last n_seasons. Goalie ratings are leak-free (each uses only earlier games)."""
+    games in the last n_seasons. Goalie ratings are leak-free (each uses only earlier games).
+    Note on xG: the team ratings only use xG from earlier games, but the xG shot model itself
+    (model/xg_params.json) is fitted on all seasons. That's a league-level shot-quality curve, so the leak
+    is small, but for a strict test refit nhl_xg.py on seasons before the test window."""
     D = D or load_data(data_dir, use_goalies=goalies, log=log)
     fin, teams = D["fin"], D["teams"]
-    long_base = D["long"] if rest else D["long"].assign(b2b=0, opp_b2b=0)
     use_g = D["goalies_on"] and goalies is not False
+    long_base = goalie_mix(D["long"], goalie_xg_blend if (use_g and D.get("gsax_on")) else 0.0)
+    long_base = long_base if rest else long_base.assign(b2b=0, opp_b2b=0)
     seasons = sorted(fin["season"].unique())
     complete = [s for s in seasons if (fin["season"] == s).sum() > 500]
     tests = [s for s in complete[-n_seasons:] if s != seasons[0]]
@@ -519,7 +611,8 @@ def walk_forward(data_dir="data", n_seasons=3, half_life_days=DEFAULT_HALF_LIFE,
             if chunk.empty:
                 continue
             train = long_base[long_base["game_date"] < a]
-            beta, extra, _, _ = fit_ratings(train, teams, a, half_life_days, alpha, carryover, shot_blend, use_g)
+            beta, extra, _, _ = fit_ratings(train, teams, a, half_life_days, alpha, carryover, shot_blend, use_g,
+                                            xg_blend)
             mw = None
             if margin_cal:
                 tg = fin[fin["game_date"] < a].tail(4000)
@@ -729,4 +822,5 @@ class Predictor:
         cutoff = pd.Timestamp(self.meta["trained_through"]) - pd.Timedelta(days=400)
         t = self.gtable
         t = t[(t["starts"] >= min_starts) & (pd.to_datetime(t["last_game"]) >= cutoff)]
-        return t.sort_values("rating_gpg", ascending=False)[["name", "team", "starts", "sv_pct", "rating_gpg"]]
+        cols = ["name", "team", "starts", "sv_pct"] + (["gsax"] if "gsax" in t.columns else []) + ["rating_gpg"]
+        return t.sort_values("rating_gpg", ascending=False)[cols]
