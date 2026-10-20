@@ -1,4 +1,7 @@
-data/
+data/*.csv
+data/shots.parquet
+data/shot_xg.parquet
+odds_api_key.txt
 odds_api_key.txt
 __pycache__/
 *.pyc

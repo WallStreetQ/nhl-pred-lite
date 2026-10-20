@@ -1,0 +1,85 @@
+# Daily refresh: runs refresh.py on GitHub so you don't have to. (Same pattern as the NBA repo.)
+#
+#   ~10 AM ET   full refresh: last night's results, periods, goalies, shots/xG, schedule, retrain,
+#               opening odds, prediction + edge logs
+#   ~6 PM ET    closing odds before puck drop (refresh.py --skip-fetch: no data fetch)
+#
+# GitHub schedules are in UTC, so each run lands an hour earlier in winter (EST) than in summer (EDT).
+# Minutes are set off the hour on purpose: runs scheduled on the hour start late most often.
+# refresh.py --push commits model/ and data/*.parquet (Streamlit redeploys about a minute later) and
+# rebases + retries by itself if you pushed from VS Code in the meantime.
+#
+# The two shot-level files (data/shots.parquet, data/shot_xg.parquet) are too big to commit twice a day,
+# so they live in this workflow's cache instead. The very first run has no cache yet and backfills them
+# from the NHL API (~1 hour); every run after that takes a few minutes.
+
+name: Daily refresh
+
+on:
+  schedule:
+    - cron: "7 14 * * *"     # 10:07 AM EDT / 9:07 AM EST  (morning)
+    - cron: "7 22 * * *"     # 6:07 PM EDT / 5:07 PM EST   (evening)
+  workflow_dispatch:         # run it by hand: Actions -> Daily refresh -> Run workflow
+    inputs:
+      mode:
+        description: "Which refresh"
+        type: choice
+        options: [morning, evening]
+        default: morning
+
+concurrency:
+  group: nhl-refresh
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120     # only the first run (shot backfill) needs this long
+    env:
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+      MODE: ${{ github.event.inputs.mode || (github.event.schedule == '7 22 * * *' && 'evening' || 'morning') }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -r requirements.txt pyarrow requests
+
+      - name: Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+
+      - name: Restore shot data
+        if: env.MODE == 'morning'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/shots.parquet
+            data/shot_xg.parquet
+          key: nhl-shots-${{ github.run_id }}
+          restore-keys: nhl-shots-
+
+      - name: Refresh and publish (${{ env.MODE }})
+        run: |
+          if [ "$MODE" = "evening" ]; then
+            python refresh.py --skip-fetch --push
+          else
+            python refresh.py --push
+          fi
+
+      - name: Save shot data
+        if: always() && env.MODE == 'morning'    # also after a failure, so a partial backfill isn't lost
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/shots.parquet
+            data/shot_xg.parquet
+          key: nhl-shots-${{ github.run_id }}

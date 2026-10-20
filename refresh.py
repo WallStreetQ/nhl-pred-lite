@@ -23,8 +23,12 @@ Run once in the morning and once shortly before the first puck drop to capture o
   python refresh.py --skip-fetch --push   (late run: skips the slow data fetch, still pulls fresh odds)
   python refresh.py --no-odds             # don't call the odds API this run
 
-What gets published: model/model_artifact.json, model/prediction_log.csv and model/edge_log.csv (all small).
-Your raw data/ folder stays local. Run it from the project folder.
+What gets published (--push): the model files (model/model_artifact.json, prediction_log.csv, edge_log.csv,
+xg_params.json) AND the data the next refresh needs (data/*.parquet, data/upcoming.json), so the GitHub
+Action (.github/workflows/daily-refresh.yml) can run the refresh itself. Two shot-level files are too big
+to commit twice a day (see LOCAL_ONLY); the Action keeps those in its cache. CSV twins stay local
+(.gitignore). If the remote has newer commits, the push rebases onto them and retries by itself.
+Run it from the project folder.
 """
 
 import argparse
@@ -44,6 +48,7 @@ XG_PARAMS = ROOT / "model" / "xg_params.json"
 EDGE_LOG = ROOT / "model" / "edge_log.csv"
 EDGE_FLAG = 0.03            # model minus Hard Rock no-vig probability (3 points) that counts as a flagged edge
 UPCOMING = ROOT / "data" / "upcoming.json"
+LOCAL_ONLY = {"shots.parquet", "shot_xg.parquet"}   # too big to commit twice a day; never pushed
 VOLATILE_META = {"fitted_at", "as_of"}
 
 
@@ -66,22 +71,33 @@ def git(*args, check=True, capture=False):
     return subprocess.run(["git", *args], cwd=ROOT, check=check, text=True, capture_output=capture)
 
 
+def published_files():
+    """Model files + the data the next refresh needs (minus the big shot-level files)."""
+    files = [ARTIFACT, PRED_LOG, EDGE_LOG, XG_PARAMS, UPCOMING]
+    files += sorted(p for p in (ROOT / "data").glob("*.parquet") if p.name not in LOCAL_ONLY)
+    return [p for p in files if p.exists()]
+
+
 def publish(message):
     print("\n=== Publish to GitHub ===")
     if git("rev-parse", "--is-inside-work-tree", check=False, capture=True).returncode != 0:
         sys.exit("[stopped] This folder isn't a git repository yet. See DEPLOY.md, 'First-time setup'.")
-    for p in (ARTIFACT, PRED_LOG, EDGE_LOG):
-        if p.exists():
-            git("add", str(p.relative_to(ROOT)))
+    for p in published_files():
+        git("add", str(p.relative_to(ROOT)))
     if git("diff", "--cached", "--quiet", check=False).returncode == 0:
-        print("Model files are unchanged - nothing to commit.")
+        print("Model and data files are unchanged - nothing to commit.")
         return
     git("commit", "-m", message)
-    if git("push", check=False).returncode != 0:
-        print("\n[push failed] The commit is saved locally. If the remote has newer commits, run\n"
-              "  git pull --rebase\n  git push\nthen Streamlit will pick it up.")
-        sys.exit(1)
-    print("Pushed. Streamlit Cloud will redeploy in about a minute.")
+    for attempt in range(1, 4):
+        if git("push", check=False).returncode == 0:
+            print("Pushed. Streamlit Cloud will redeploy in about a minute.")
+            return
+        print(f"  push rejected (try {attempt}/3) - rebasing onto the newer remote commits and retrying")
+        if git("pull", "--rebase", check=False).returncode != 0:
+            git("rebase", "--abort", check=False)
+            sys.exit("\n[push failed] Rebasing hit a conflict. The commit is saved locally; run\n"
+                     "  git pull --rebase\nfix any conflicts, then\n  git push")
+    sys.exit("\n[push failed] after 3 tries. The commit is saved locally; run  git pull --rebase  then  git push")
 
 
 # ------------------------------------------------------------------------------------------
@@ -271,7 +287,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--skip-fetch", action="store_true", help="don't call the NHL API; retrain from existing data/")
     ap.add_argument("--days-back", type=int, default=3, help="days to sweep for newly finished games (default 3)")
-    ap.add_argument("--push", action="store_true", help="git commit + push the model files when done")
+    ap.add_argument("--push", action="store_true", help="git commit + push the model and data files when done")
     ap.add_argument("--backtest", action="store_true", help="run the walk-forward backtest and store its scores")
     ap.add_argument("--half-life", type=float, default=DEFAULT_HALF_LIFE, help="recency half-life (days)")
     ap.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, help="ridge strength")
@@ -353,7 +369,7 @@ def main():
     if args.push:
         publish(f"Update model through {m['trained_through']}")
     else:
-        print("\nTo publish: python refresh.py --skip-fetch --push   (or git add/commit/push the model/ folder)")
+        print("\nTo publish: python refresh.py --skip-fetch --push   (or git add/commit/push the model/ and data/ files)")
 
 if __name__ == "__main__":
     main()
