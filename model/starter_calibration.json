@@ -1,0 +1,21 @@
+{
+  "p_start": {
+    "b2b_swap|clear No. 1": 0.821,
+    "b2b_swap|leaning": 0.892,
+    "b2b_swap|split": 0.813,
+    "fresh|clear No. 1": 0.81,
+    "fresh|leaning": 0.76,
+    "fresh|split": 0.667,
+    "repeat|clear No. 1": 0.695,
+    "repeat|leaning": 0.598,
+    "rotation|leaning": 0.531,
+    "rotation|split": 0.591
+  },
+  "n_games": 7872,
+  "seasons": [
+    "20232024",
+    "20242025",
+    "20252026"
+  ],
+  "measured_at": "2026-11-04T15:09:48"
+}
