@@ -28,6 +28,11 @@ Model (v3)
   * Goalies: the opposing goalie's rating can come from save% (default), from goals saved above expected
     (GSAx, data/goalie_xg from nhl_xg.py), or a mix: rating = (1 - goalie_xg_blend) x sv% rating
     + goalie_xg_blend x GSAx rating. Both are leak-free and in goals/game vs an average goalie.
+  * Confidence calibration: the ridge + recency shrinkage pulls matchups toward even, so favourites win
+    more often than the raw model says (backtest and the live log both show it). Each game's two
+    expected-goal rates are pushed apart by confidence_k on the log scale, keeping their SUM fixed, so
+    win/puck-line probabilities sharpen while totals are untouched. 1.0 = off. Pick k with
+    `python refresh.py --tune-k` (walk-forward); the margin/total grid is refitted on the adjusted rates.
   * ARI history is merged into UTA (same roster moved).
 
 Depends on goalie_features.py (fitter + goalie ratings).
@@ -52,11 +57,30 @@ DEFAULT_CARRYOVER = 0.7      # weight multiplier per season boundary crossed (1 
 DEFAULT_SHOT_BLEND = 0.25    # share of team ratings from the shots model (0 = off); walk-forward tuned
 DEFAULT_XG_BLEND = 0.25      # share of team ratings from the xG model (0 = off); walk-forward tuned on totals
 DEFAULT_GOALIE_XG_BLEND = 0.0  # share of goalie ratings from GSAx instead of sv% (0 = sv% only); tune it
+DEFAULT_CONFIDENCE_K = 1.1   # spread multiplier on log(lam_home / lam_away) (1 = off). Walk-forward 2022-26:
+                             # moneyline log-loss best at 1.1-1.2, puck line/3-way slightly worse above 1.2.
+                             # Re-check with `python refresh.py --tune-k` as the season's log grows.
 TEAM_ALIASES = {"ARI": "UTA"}
 MAX_GOALS = 12
 MARGIN_BUCKETS = 5           # |margin| 0,1,2,3,4+
 REST_COLS = ["b2b", "opp_b2b"]
 MIN_SIDE_ROWS = 200          # a shots/xG side model needs this many team-games, else its weight stays on goals
+
+
+def stretch_lams(lam_h, lam_a, k):
+    """Push the two expected-goal rates apart by factor k on the log-ratio scale, keeping their sum.
+    k = 1 returns the inputs unchanged. Works on scalars or arrays."""
+    if k is None or abs(float(k) - 1.0) < 1e-12:
+        return lam_h, lam_a
+    lh, la = np.asarray(lam_h, float), np.asarray(lam_a, float)
+    half = 0.5 * float(k) * np.log(lh / la)
+    m = np.sqrt(lh * la)
+    nh, na = m * np.exp(half), m * np.exp(-half)
+    scale = (lh + la) / (nh + na)
+    nh, na = nh * scale, na * scale
+    if np.ndim(lam_h) == 0:
+        return float(nh), float(na)
+    return nh, na
 
 
 # ======================================================================================
@@ -501,7 +525,7 @@ def b2b_same_goalie_rate(gk):
 
 def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFAULT_ALPHA,
                    carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, xg_blend=DEFAULT_XG_BLEND,
-                   goalie_xg_blend=DEFAULT_GOALIE_XG_BLEND,
+                   goalie_xg_blend=DEFAULT_GOALIE_XG_BLEND, confidence_k=DEFAULT_CONFIDENCE_K,
                    playoff_weight=0.5, use_goalies="auto", min_goalie_coverage=0.95,
                    pool_starts=25, as_of=None, upcoming=None, log=print):
     D = load_data(data_dir, playoff_weight, use_goalies, min_goalie_coverage, log)
@@ -523,12 +547,14 @@ def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFA
     log(f"fit: home {diag['home_coef']:+.3f} | b2b {diag['b2b_coef']:+.3f} | opp b2b {diag['opp_b2b_coef']:+.3f}"
         + (f" | goalie beta {diag['goalie_beta']:+.2f}" if D["goalies_on"] else "")
         + f" | effective alpha {alpha_eff:.3f}"
-        + f" | blend: shots {used.get('shots', 0):g}, xG {used.get('xg', 0):g}")
+        + f" | blend: shots {used.get('shots', 0):g}, xG {used.get('xg', 0):g}"
+        + f" | confidence k {confidence_k:g}")
     if xg_blend > 0 and "xg" not in used:
         log(f"  xg_blend={xg_blend:g} requested but no usable xG data (data/game_xg) - its weight stayed on goals")
 
     gids = fin["game_id"].values
     lh, la = _home_away_lams(beta, teams, extra, long_base, gids)
+    lh, la = stretch_lams(lh, la, confidence_k)      # grid is fitted on the same rates the app will use
     grid_w = fit_grid_weights(lh, la, fin["home_reg"].values, fin["away_reg"].values,
                               _recency(fin["game_date"], as_of, half_life_days) * fin["type_weight"].values)
     log("margin weights for |reg margin| 0,1,2,3,4+: " + ", ".join(f"{x:.2f}" for x in grid_w["margin"]))
@@ -586,9 +612,10 @@ def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFA
                  "gsax_coverage": D["gsax_coverage"], "gsax_k_attempts": D["k_attempts"],
                  "goalies_on": D["goalies_on"], "goalie_coverage": D["coverage"], "goalie_beta": diag["goalie_beta"],
                  "home_coef": diag["home_coef"], "b2b_coef": diag["b2b_coef"], "opp_b2b_coef": diag["opp_b2b_coef"],
+                 "confidence_k": confidence_k,
                  "period_share_K": share_K, "active_teams": active_teams, "season_gp": gp,
                  "team_aliases": TEAM_ALIASES},
-        "teams": teams, "beta": beta.tolist(), "extra_cols": extra,
+        "teams": teams, "beta": beta.tolist(), "extra_cols": extra, "confidence_k": confidence_k,
         "home_ot_win": D["home_ot_win"], "mean_goals": D["mean_goals"], "grid_weights": grid_w,
         "period_shares": shares, "goalies": goalie_block, "last_played": last_played, "slate": slate,
     }
@@ -618,13 +645,15 @@ def build_slate(upcoming, last_played, last_date):
 
 def walk_forward(data_dir="data", n_seasons=3, half_life_days=DEFAULT_HALF_LIFE, alpha=DEFAULT_ALPHA,
                  carryover=DEFAULT_CARRYOVER, shot_blend=DEFAULT_SHOT_BLEND, xg_blend=DEFAULT_XG_BLEND,
-                 goalie_xg_blend=DEFAULT_GOALIE_XG_BLEND,
+                 goalie_xg_blend=DEFAULT_GOALIE_XG_BLEND, confidence_k=DEFAULT_CONFIDENCE_K,
                  goalies="auto", margin_cal=True, rest=True, refit_days=30, D=None, log=print):
     """Refit every `refit_days` using only earlier games and predict the next block. Scores regular-season
     games in the last n_seasons. Goalie ratings are leak-free (each uses only earlier games).
     Note on xG: the team ratings only use xG from earlier games, but the xG shot model itself
     (model/xg_params.json) is fitted on all seasons. That's a league-level shot-quality curve, so the leak
-    is small, but for a strict test refit nhl_xg.py on seasons before the test window."""
+    is small, but for a strict test refit nhl_xg.py on seasons before the test window.
+    Note on goalies: test games use the ACTUAL starter's rating (known only once starters are confirmed),
+    while the live prediction log uses each team's usual mix, so live scores will run a little worse."""
     D = D or load_data(data_dir, use_goalies=goalies, log=log)
     fin, teams = D["fin"], D["teams"]
     use_g = D["goalies_on"] and goalies is not False
@@ -643,17 +672,23 @@ def walk_forward(data_dir="data", n_seasons=3, half_life_days=DEFAULT_HALF_LIFE,
             if chunk.empty:
                 continue
             train = long_base[long_base["game_date"] < a]
+            prior = fin[fin["game_date"] < a]
+            # home OT/SO win rate from earlier games only (no peeking at the test block)
+            ot_prev = prior[(prior["game_type"] == 2) & (prior["home_reg"] == prior["away_reg"])]
+            hot = float((ot_prev["home_score"] > ot_prev["away_score"]).mean()) if len(ot_prev) > 100 else 0.518
             beta, extra, _, _ = fit_ratings(train, teams, a, half_life_days, alpha, carryover, shot_blend, use_g,
                                             xg_blend)
             mw = None
             if margin_cal:
-                tg = fin[fin["game_date"] < a].tail(4000)
+                tg = prior.tail(4000)
                 tlh, tla = _home_away_lams(beta, teams, extra, train, tg["game_id"].values)
+                tlh, tla = stretch_lams(tlh, tla, confidence_k)
                 mw = fit_grid_weights(tlh, tla, tg["home_reg"].values, tg["away_reg"].values,
                                       _recency(tg["game_date"], a, half_life_days) * tg["type_weight"].values)
             lh, la = _home_away_lams(beta, teams, extra, long_base, chunk["game_id"].values)
+            lh, la = stretch_lams(lh, la, confidence_k)
             for i, g in enumerate(chunk.itertuples()):
-                gd = GameDist(lh[i], la[i], D["home_ot_win"], mw)
+                gd = GameDist(lh[i], la[i], hot, mw)
                 tot = g.home_score + g.away_score
                 rows.append({"season": s, "date": g.game_date, "lam_tot": lh[i] + la[i],
                              "reg_tot": g.home_reg + g.away_reg, "exp_final": gd.exp_home + gd.exp_away,
@@ -677,6 +712,8 @@ def summarize_backtest(r, tests):
         return float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
     preg = r[["p_h", "p_t", "p_a"]].values
     ll3 = float(-np.mean(np.log(np.clip(preg[np.arange(len(r)), r["y_reg"].values], 1e-6, 1))))
+    by_season = {str(s): {"win_logloss": ll(g["p_win"], g["y_win"]), "win_brier": brier(g["p_win"], g["y_win"]),
+                          "pl_brier": brier(g["p_cover"], g["y_cover"])} for s, g in r.groupby("season")}
     return {"seasons": [str(s) for s in tests], "n_games": int(len(r)),
             "win_brier": brier(r["p_win"], r["y_win"]), "win_logloss": ll(r["p_win"], r["y_win"]),
             "const_brier": brier(np.full(len(r), r["y_win"].mean()), r["y_win"]),
@@ -688,6 +725,7 @@ def summarize_backtest(r, tests):
             "early_win_brier": brier(r.loc[r["early"], "p_win"], r.loc[r["early"], "y_win"]),
             "early_n": int(r["early"].sum()),
             "pred_cover": float(r["p_cover"].mean()), "actual_cover": float(r["y_cover"].mean()),
+            "by_season": by_season,
             "raw": r}
 
 
@@ -726,6 +764,7 @@ class Predictor:
         self.grid_w = art.get("grid_weights")
         self.extra = art["extra_cols"]
         self.beta = np.array(art["beta"])
+        self.confidence_k = float(art.get("confidence_k") or 1.0)   # older artifacts: no adjustment
         self.period_shares = {t: {int(k): v for k, v in s.items()} for t, s in art["period_shares"].items()}
         self.slate = art.get("slate", [])
         self.odds = art.get("odds") or {}
@@ -799,7 +838,7 @@ class Predictor:
         return team
 
     def lambdas(self, home, away, home_goalie=None, away_goalie=None, home_b2b=False, away_b2b=False):
-        """Expected REGULATION goals for each side."""
+        """Expected REGULATION goals for each side (after the confidence adjustment)."""
         home, away = self.resolve(home), self.resolve(away)
         rows = pd.DataFrame({"team": [home, away], "opponent": [away, home], "is_home": [1, 0],
                              "b2b": [int(home_b2b), int(away_b2b)], "opp_b2b": [int(away_b2b), int(home_b2b)]})
@@ -810,7 +849,8 @@ class Predictor:
             rows["opp_goalie_effect"] = [eff_h, eff_a]
             info = i_home + i_away
         lam = _predict_rows(self.beta, self.teams, self.extra, rows)
-        return float(lam[0]), float(lam[1]), info
+        lh, la = stretch_lams(float(lam[0]), float(lam[1]), self.confidence_k)
+        return lh, la, info
 
     def predict_game(self, home, away, home_goalie=None, away_goalie=None, total_line=6.5, home_spread=-1.5,
                      home_team_line=2.5, away_team_line=2.5, home_b2b=False, away_b2b=False):
@@ -849,7 +889,9 @@ class Predictor:
         """Model vs book at the PRIMARY book's exact lines. One row per side of each priced market:
             market, side, label, line, price, model_p (win), push, model_cond (win | no push),
             fair (book no-vig, given no push), edge = model_cond - fair, ev (per 1 unit staked, push = refund),
-            hold (book margin), ref_fair (reference book no-vig at the SAME line, else None)."""
+            hold (book margin), ref_fair (reference book no-vig at the SAME line, else None),
+            ref_agrees (reference book prices this side above the primary book; None if no reference price),
+            flag (passes the flag rule - see flag_rule)."""
         primary = primary or self.odds.get("primary", "hardrockbet_fl")
         reference = reference or self.odds.get("reference", "pinnacle")
         book, ref = game_odds.get(primary) or {}, game_odds.get(reference) or {}
@@ -886,11 +928,14 @@ class Predictor:
             for (side, label, p, push, price), f, rf in zip(sides, fair, ref_fair):
                 dec = american_to_decimal(price)
                 cond = p / (1 - push) if push < 1 else 0.0
+                edge = float(cond - f)
                 rows.append({"market": market, "side": side, "label": label, "line": point, "price": int(price),
                              "dec": dec, "model_p": float(p), "push": float(push), "model_cond": float(cond),
-                             "fair": float(f), "edge": float(cond - f),
+                             "fair": float(f), "edge": edge,
                              "ev": float(p * (dec - 1) - max(0.0, 1 - p - push)), "hold": hold,
-                             "ref_fair": None if rf is None else float(rf)})
+                             "ref_fair": None if rf is None else float(rf),
+                             "ref_agrees": None if rf is None else bool(rf > f),
+                             "flag": flag_rule(edge, float(f), None if rf is None else float(rf))})
         return rows
 
     # ---------- display helpers ----------
@@ -911,3 +956,26 @@ class Predictor:
         t = t[(t["starts"] >= min_starts) & (pd.to_datetime(t["last_game"]) >= cutoff)]
         cols = ["name", "team", "starts", "sv_pct"] + (["gsax"] if "gsax" in t.columns else []) + ["rating_gpg"]
         return t.sort_values("rating_gpg", ascending=False)[cols]
+
+
+# ======================================================================================
+# Flag rule (shared by refresh.py's edge log and the app's Edges board)
+# ======================================================================================
+
+EDGE_FLAG = 0.03            # model minus the primary book's no-vig probability (3 points)
+FLAG_RULE = "v2"            # v1 = edge only; v2 = edge AND the sharp book agrees (see flag_rule)
+
+
+def flag_rule(edge, fair, ref_fair, min_edge=EDGE_FLAG):
+    """v2: flag a side only when
+         1) the model is at least `min_edge` above Hard Rock's no-vig probability, AND
+         2) Pinnacle's no-vig probability for the same side at the same line is also above Hard Rock's
+            (the sharp market leans the same way), or - when Pinnacle has no price at that line - the side
+            is not an underdog (fair >= 50%).
+    Why: in the first live weeks, flags Pinnacle disagreed with went 9-14 and underdog flags 3-10, while
+    the rest won; the model's raw lean toward underdogs is mostly its own shrinkage, not market error."""
+    if edge is None or not np.isfinite(edge) or edge < min_edge:
+        return False
+    if ref_fair is None or not np.isfinite(ref_fair):
+        return bool(fair >= 0.5)
+    return bool(ref_fair > fair)

@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from nhl_model import Predictor, load_artifact
+from nhl_model import EDGE_FLAG, FLAG_RULE, Predictor, load_artifact
 
 ROOT = Path(__file__).parent
 ART_PATH = ROOT / "model" / "model_artifact.json"
@@ -24,6 +24,7 @@ EARLY_GP = 10
 STALE_HOURS = 6
 NHL_MARKETS = ["Moneyline", "Puck line", "Total"]
 EDGE_BUCKETS = [(-np.inf, 0.04, "Under 4 pts"), (0.04, 0.07, "4–7 pts"), (0.07, np.inf, "7+ pts")]
+RULE_NAMES = {"v2": "Current rule (Pinnacle agrees)", "v1": "Old rule (edge only)"}
 
 st.set_page_config(page_title="NHL Game Predictor", page_icon="🏒", layout="wide")
 
@@ -44,6 +45,7 @@ st.markdown("""
 .chip.P {background:#6b7280; color:#fff; border-color:#6b7280;}
 .chip.b2b {background:rgba(234,179,8,.15); color:#ca8a04; border-color:rgba(234,179,8,.45);}
 .chip.warn {background:rgba(234,179,8,.15); color:#ca8a04; border-color:rgba(234,179,8,.45);}
+.chip.ok {background:rgba(22,163,74,.13); color:#16a34a; border-color:rgba(22,163,74,.4);}
 .chip.live {background:rgba(239,68,68,.12); color:#ef4444; border-color:rgba(239,68,68,.4);}
 .score {font-size:1.3rem; font-weight:700; margin:6px 0 2px;}
 .sel {font-size:1.22rem; font-weight:800; margin:6px 0 2px;}
@@ -275,6 +277,7 @@ def board_rows(art_mt: float, code_mt: float, primary: str) -> list[dict]:
                          "game": f"{g['away']} @ {g['home']}", "market": e["market"], "label": e["label"],
                          "price": e["price"], "model": e["model_cond"], "fair": e["fair"], "edge": e["edge"],
                          "ev": e["ev"], "ref_fair": e["ref_fair"], "hold": e["hold"],
+                         "ref_agrees": e.get("ref_agrees"), "flag": bool(e.get("flag")),
                          "src": go[primary].get("source", primary)})
     return rows
 
@@ -283,6 +286,11 @@ st.title("🏒 NHL Game Predictor")
 st.caption(f"Model trained through **{meta['trained_through']}** · {meta['n_games']:,} games · "
            f"goalie data **{'ON' if pred.goalies_on else 'OFF'}**"
            + (f" · {BOOK} odds **{et_time(odds['pulled_at'])} ET**" if odds.get("pulled_at") else ""))
+_fitted = pd.to_datetime(meta.get("fitted_at"), errors="coerce")
+_today = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+if pd.notna(_fitted) and _today.month not in (7, 8) and (_today - _fitted).total_seconds() > 36 * 3600:
+    st.warning(f"The model hasn't been refreshed since {_fitted:%b %-d, %I:%M %p}. Results, the Track Record and "
+               "today's slate are out of date - check the Daily refresh workflow in GitHub Actions.")
 
 tab_board, tab_slate, tab_game, tab_track, tab_model = st.tabs(
     ["🎯 Edges board", "📅 Today's Slate", "🧮 Game Markets", "📈 Track Record", "📊 Model"])
@@ -305,6 +313,9 @@ with tab_board:
             bd["_start"] = [pd.to_datetime(s, utc=True) if s else pd.Timestamp(d, tz="America/New_York").tz_convert("UTC")
                             for s, d in zip(bd["start"], bd["date"])]
             bd["started"] = bd["_start"] <= now
+            # sharp-confirmed: Pinnacle leans the same way at the same line; with no Pinnacle price, not an underdog
+            bd["confirmed"] = [bool(a) if a is not None and not pd.isna(a) else f >= 0.5
+                               for a, f in zip(bd["ref_agrees"], bd["fair"])]
             days = sorted(bd["date"].unique())
             upcoming = [d for d in days if not bd.loc[bd["date"] == d, "started"].all()]
             default_day = upcoming[0] if upcoming else days[-1]
@@ -315,12 +326,19 @@ with tab_board:
                             label_visibility="collapsed", key="eb_mk")
             thr = c2.select_slider("Minimum edge", [0, 2, 3, 4, 5, 7], 3, key="eb_thr",
                                    format_func=lambda x: f"{x}+ pts" if x else "Every side")
+            sharp_only = st.toggle(f"Only sides {REF_BOOK} agrees with", value=True, key="eb_sharp",
+                                   help=f"Shows a side only when {REF_BOOK}'s no-vig chance is also above {BOOK}'s "
+                                        f"(or, with no {REF_BOOK} price, when it isn't an underdog). This is the rule "
+                                        "the Track Record grades. Early-season flags without that agreement went "
+                                        "9-14 and underdog flags 3-10.")
             day = day or default_day
             if day != "All":
                 bd = bd[bd["date"] == day]
             show = bd[bd["market"].isin(mkts or NHL_MARKETS)]
             if thr:
                 show = show[show["edge"] >= thr / 100]
+            if sharp_only:
+                show = show[show["confirmed"]]
             show = show.sort_values(["_start", "edge"], ascending=[True, False])
             st.caption(f"{len(show)} of {len(bd)} priced sides · {bd['game'].nunique()} games · average {BOOK} margin "
                        f"{100 * bd['hold'].mean():.1f}% · edge = model chance (pushes excluded) minus {BOOK}'s no-vig "
@@ -337,9 +355,15 @@ with tab_board:
                     has_ref = not pd.isna(e["ref_fair"])
                     ref_t = tile(REF_BOOK, pct(e["ref_fair"]) if has_ref else "—", "sharp fair" if has_ref else "not posted")
                     warn = ""
-                    if has_ref and e["edge"] > 0 and e["ref_fair"] <= e["fair"]:
+                    if e["edge"] > 0 and e["confirmed"] and has_ref:
+                        warn = (f'<div style="margin-top:6px"><span class="chip ok">✓ {REF_BOOK} leans this way'
+                                '</span></div>')
+                    elif has_ref and e["edge"] > 0 and e["ref_fair"] <= e["fair"]:
                         warn = (f'<div style="margin-top:6px"><span class="chip warn">⚠ {REF_BOOK} sides with '
                                 f'{BOOK}, not the model</span></div>')
+                    elif e["edge"] > 0 and not e["confirmed"]:
+                        warn = ('<div style="margin-top:6px"><span class="chip warn">⚠ underdog with no sharp price '
+                                '- not flagged</span></div>')
                     if e["src"] == "hardrockbet":
                         warn += ('<div style="margin-top:6px"><span class="chip">main Hard Rock feed - confirm '
                                  'the FL price</span></div>')
@@ -355,8 +379,8 @@ with tab_board:
                       <div class="grid">{model_t}{edge_t}{kelly_t}{ref_t}</div>{warn}
                     </div>""", unsafe_allow_html=True)
             st.caption(f"{REF_BOOK} is the sharp market's view at the same line: if it sides with {BOOK} rather than "
-                       "the model, be sceptical of the edge. Set confirmed starters on the Game Markets tab to re-price a "
-                       "game. The Track Record tab shows whether flagged edges have held up.")
+                       "the model, the edge is more likely the model's own error. Set confirmed starters on the Game "
+                       "Markets tab to re-price a game. The Track Record tab shows whether flagged edges have held up.")
 
 # ================================================================== Slate
 with tab_slate:
@@ -593,12 +617,15 @@ REC_CFG = {"Win %": st.column_config.NumberColumn(format="percent"),
            "Units": st.column_config.NumberColumn(format="%+.2f"),
            "ROI": st.column_config.NumberColumn(format="percent"),
            "Beat close": st.column_config.NumberColumn(format="percent"),
-           "Avg CLV": st.column_config.NumberColumn(format="percent", help="Closing no-vig prob. minus your break-even prob.")}
+           "Avg CLV": st.column_config.NumberColumn(format="percent",
+                                                    help="Closing no-vig prob. minus opening no-vig prob. (margin-free)")}
 
 with tab_track:
     # ---------------------------------------------------------------- flagged edges
     st.markdown(f"#### Flagged edges at {BOOK}")
     el = get_edges(EDGE_PATH.stat().st_mtime) if EDGE_PATH.exists() else pd.DataFrame()
+    if not el.empty and "flag_rule" not in el:
+        el["flag_rule"] = "v1"
     fl = el[is_true(el["flag"])] if "flag" in el else el.iloc[0:0]
     done = fl[fl["result"].notna()].copy() if "result" in fl else fl.iloc[0:0]
     if done.empty:
@@ -612,20 +639,29 @@ with tab_track:
         markets = [m for m in NHL_MARKETS if (done["market"] == m).any()] + \
             sorted(set(done["market"]) - set(NHL_MARKETS))
 
-        f1, f2 = st.columns([2, 3])
+        rules = [r for r in (FLAG_RULE, "v1") if (done["flag_rule"] == r).any()]
+        f0, f1, f2 = st.columns([2, 2, 3])
+        rule_pick = f0.segmented_control("Rule", rules + ["All"], default=rules[0] if rules else "All",
+                                         format_func=lambda r: {"All": "All flags", FLAG_RULE: "Current rule",
+                                                                "v1": "Old rule"}.get(r, r),
+                                         label_visibility="collapsed", key="rec_rule")
         window = f1.segmented_control("Period", ["7D", "30D", "Season", "All"], default="All",
                                       label_visibility="collapsed", key="rec_win")
         mks = f2.pills("Market filter", markets, selection_mode="multi", default=markets,
                        label_visibility="collapsed", key="rec_mk")
-        last = done["date"].max()
+        if rule_pick and rule_pick != "All":
+            done = done[done["flag_rule"] == rule_pick]
+        last = done["date"].max() if len(done) else pd.Timestamp.today()
         if window in ("7D", "30D"):
             done = done[done["date"] > last - pd.Timedelta(days=int(window[:-1]))]
-        elif window == "Season":                       # NHL season opens in October
+        elif window == "Season":                       # NHL season opens in late September / October
             done = done[done["date"] >= pd.Timestamp(last.year if last.month >= 9 else last.year - 1, 9, 1)]
         done = done[done["market"].isin(mks or markets)]
+        st.caption(f"{RULE_NAMES.get(rule_pick, 'Both rules')}. Each pick keeps the rule that flagged it when it was "
+                   f"logged: current rule = edge of {100 * EDGE_FLAG:.0f}+ pts AND {REF_BOOK} leaning the same way.")
 
         if done.empty:
-            st.info("No settled flags in this window.")
+            st.info("No settled flags in this window yet.")
         else:
             s = summary(done)
             t1, t2, t3, t4, t5 = st.columns(5)
@@ -633,11 +669,12 @@ with tab_track:
             t2.metric("Win %", pct(s["Win %"]), help="Break-even depends on the price; ROI is the better read")
             t3.metric("Units (1u flat)", f"{s['Units']:+.2f}")
             t4.metric("ROI", pct(s["ROI"]), help="Units per unit staked (pushes refunded)")
-            t5.metric("Beat the close", pct(s["Beat close"]),
+            t5.metric("Line moved our way", pct(s["Beat close"]),
                       delta=f"{100 * s['Avg CLV']:+.2f} pts avg" if not pd.isna(s["Avg CLV"]) else None,
-                      help=f"Closing line value: closing no-vig probability ({REF_BOOK} when available, else {BOOK}) "
-                           "minus the break-even probability of the price taken. Positive and consistent is the "
-                           "earliest sign of a real edge - it needs far fewer games than win/loss.")
+                      help=f"Closing-line value with the book's margin removed: {REF_BOOK}'s closing no-vig chance "
+                           f"minus its opening no-vig chance for the pick ({BOOK}'s when {REF_BOOK} has no price). "
+                           "0 = the line didn't move; positive and consistent is the earliest sign of a real edge - it "
+                           "needs far fewer games than win/loss.")
 
             st.area_chart(done.groupby("date")["profit"].sum().cumsum().rename("Cumulative units"), height=210)
 
@@ -688,14 +725,16 @@ with tab_track:
         P3 = settled[["p_home_reg", "p_tie_reg", "p_away_reg"]].values
         a1, a2, a3, a4 = st.columns(4)
         a1.metric("Games settled", f"{len(settled):,}")
-        a2.metric("Model's winner right", pct(((p >= 0.5) == (y == 1)).mean()), help="Including OT/SO")
+        a2.metric("Model's winner right", pct(((p >= 0.5) == (y == 1)).mean()),
+                  help="Including OT/SO. Over 150 games this swings roughly 52%-65% by luck alone.")
         a3.metric("Moneyline Brier", f"{((p - y) ** 2).mean():.4f}",
                   delta=f"{((p - y) ** 2).mean() - ((y.mean() - y) ** 2).mean():+.4f} vs constant", delta_color="inverse",
                   help="Lower is better. 0.25 = always saying 50%.")
         a4.metric("3-way log-loss", f"{-np.log(P3[np.arange(len(settled)), reg]).mean():.3f}",
-                  help="Regulation home / tie / away. Lower is better; ~1.04-1.05 is what the backtest achieved.")
+                  help="Regulation home / tie / away. Lower is better; the backtest got ~1.04 using the actual "
+                       "starting goalies, which live predictions don't know.")
 
-        # Total vs market - only if refresh.py logs these columns
+        # Total vs market - rows logged since refresh.py started recording the book's total line
         if {"exp_total", "total_line"} <= set(settled.columns) and settled["total_line"].notna().any():
             tl = settled["total_line"].notna()
             act_tot = settled["home_score"] + settled["away_score"]
@@ -729,7 +768,8 @@ with tab_track:
                 "Score": recent["away_score"].astype(int).astype(str) + "-" + recent["home_score"].astype(int).astype(str),
                 "OT/SO": np.where(recent["home_reg"] == recent["away_reg"], "yes", "")}), hide_index=True, width="stretch")
         st.caption("Logged by refresh.py before each game with each team's usual goalie mix, so this is honest "
-                   "out-of-sample performance.")
+                   "out-of-sample performance. Games that had started before a refresh ran keep their earlier "
+                   "pre-game row.")
 
     # ---------------------------------------------------------------- backtest
     bt = meta.get("backtest")
@@ -746,6 +786,8 @@ with tab_track:
         if bt.get("calibration"):
             st.dataframe(pd.DataFrame(bt["calibration"]).rename(columns={"bucket": "Home win prob.", "predicted": "Predicted",
                          "actual": "Actual", "n": "Games"}).round(3), hide_index=True, width="stretch")
+        st.caption("The backtest knows each game's actual starting goalies; the live log uses each team's usual mix, "
+                   "so live numbers run a little worse for the same model.")
 
 # ================================================================== Model
 with tab_model:
@@ -763,10 +805,12 @@ with tab_model:
     else:
         st.caption("Goalie ratings appear once goalie data is included in the model.")
     b2b = meta.get("b2b_coef")
+    ck = meta.get("confidence_k", 1) or 1
     st.caption(
         f"Recency half-life {meta['half_life_days']:g} days · ridge α {meta['alpha_l2']:g} "
         f"(effective {meta.get('alpha_eff', meta['alpha_l2']):.3f}) · past-season weight {meta.get('carryover', 1):g} · "
         f"shots blend {meta.get('shot_blend', 0):.0%} · xG blend {meta.get('xg_blend_used', 0):.0%}"
+        + (f" · confidence adjustment ×{ck:g}" if abs(ck - 1) > 1e-9 else "")
         + (f" · teams on a back-to-back score {100 * (np.exp(b2b) - 1):+.1f}%" if b2b is not None else "")
         + f" · fitted {meta['fitted_at']}. The model predicts regulation goals; ties are settled by one OT/SO goal and the "
         "score grid is calibrated to real overtime and empty-net frequencies. For information and entertainment only - "

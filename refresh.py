@@ -9,7 +9,8 @@ GitHub so the Streamlit app redeploys with the new model.
   python refresh.py --push           # ...then git commit + push  (Streamlit Cloud redeploys automatically)
   python refresh.py --skip-fetch     # just retrain from the data you already have
   python refresh.py --backtest       # also run the walk-forward backtest (~20 s) and store its scores
-  python refresh.py --days-back 3    # sweep more days for late/postponed games (default 2)
+  python refresh.py --tune-k         # walk-forward check of the confidence adjustment (1.0-1.4), then exit
+  python refresh.py --days-back 3    # sweep more days for late/postponed games (default 3)
 
 Expected goals: once you've run nhl_shots.py and nhl_xg.py once (which writes model/xg_params.json),
 each refresh also pulls shot data for new games and re-scores xG with the saved model (no refit).
@@ -22,6 +23,16 @@ pre-game price ("close"), then the result and closing-line value once the game i
 Run once in the morning and once shortly before the first puck drop to capture opening and closing prices:
   python refresh.py --skip-fetch --push   (late run: skips the slow data fetch, still pulls fresh odds)
   python refresh.py --no-odds             # don't call the odds API this run
+
+Flags (edge log): a side is flagged by nhl_model.flag_rule - model at least 3 points above Hard Rock's no-vig
+probability AND Pinnacle leaning the same way (or, with no Pinnacle price, the side isn't an underdog).
+Rows record which rule flagged them (flag_rule: v1 = old edge-only rule, v2 = current), so the Track Record
+never re-grades old picks with a rule chosen after seeing their results.
+
+Closing-line value: Pinnacle's closing no-vig probability minus its opening no-vig probability for the
+side (Hard Rock's when Pinnacle has no price at that line). Positive = the market moved toward the pick.
+The book's margin is NOT in it (the old version compared against the price's break-even, which put the
+~2.5-point margin into every number). price_clv keeps the old figure: beating it means beating the margin too.
 
 What gets published (--push): the model files (model/model_artifact.json, prediction_log.csv, edge_log.csv,
 xg_params.json) AND the data the next refresh needs (data/*.parquet, data/upcoming.json), so the GitHub
@@ -46,7 +57,6 @@ ARTIFACT = ROOT / "model" / "model_artifact.json"
 PRED_LOG = ROOT / "model" / "prediction_log.csv"
 XG_PARAMS = ROOT / "model" / "xg_params.json"
 EDGE_LOG = ROOT / "model" / "edge_log.csv"
-EDGE_FLAG = 0.03            # model minus Hard Rock no-vig probability (3 points) that counts as a flagged edge
 UPCOMING = ROOT / "data" / "upcoming.json"
 LOCAL_ONLY = {"shots.parquet", "shot_xg.parquet"}   # too big to commit twice a day; never pushed
 VOLATILE_META = {"fitted_at", "as_of"}
@@ -100,6 +110,15 @@ def publish(message):
     sys.exit("\n[push failed] after 3 tries. The commit is saved locally; run  git pull --rebase  then  git push")
 
 
+def _started(g, now):
+    """True once a slate game's scheduled start has passed (unknown start time -> not started)."""
+    s = g.get("start_utc")
+    if not s:
+        return False
+    t = pd.to_datetime(s, utc=True, errors="coerce")
+    return pd.notna(t) and t <= now
+
+
 # ------------------------------------------------------------------------------------------
 # Prediction log: pre-game predictions for upcoming games, settled once results arrive
 # ------------------------------------------------------------------------------------------
@@ -108,6 +127,8 @@ def update_prediction_log(art, data_dir):
     from nhl_model import Predictor, load_data
     pred = Predictor(art)
     log = pd.read_csv(PRED_LOG) if PRED_LOG.exists() else pd.DataFrame()
+    now = pd.Timestamp.now(tz="UTC")
+    primary = pred.odds.get("primary", "hardrockbet_fl")
 
     # 1) settle finished games
     if not log.empty:
@@ -117,29 +138,53 @@ def update_prediction_log(art, data_dir):
                 log[col] = np.nan
             log[col] = log[col].fillna(log["game_id"].map(fin[col]))
 
-    # 2) log / overwrite predictions for games that haven't been played
-    new = []
+    # 2) log / overwrite predictions for games that haven't STARTED. A game that has started keeps the
+    #    last prediction logged before puck drop (or none, if no run happened in time), so every row in
+    #    the log is a genuine pre-game prediction.
+    new, skipped = [], 0
     for g in pred.slate:
+        if _started(g, now):
+            skipped += 1
+            continue
+        hb, ab = g.get("home_b2b", False), g.get("away_b2b", False)
+        book = pred.game_odds(g["game_id"]).get(primary, {}) or {}
+        total_line = (book.get("totals") or {}).get("point")
+        home_spread = (book.get("spreads") or {}).get("point")
         try:
-            hs = pred.goalie_spec(g["home"], None, b2b=g.get("home_b2b", False))
-            as_ = pred.goalie_spec(g["away"], None, b2b=g.get("away_b2b", False))
-            r = pred.predict_game(g["home"], g["away"], hs, as_, home_b2b=g.get("home_b2b", False),
-                                  away_b2b=g.get("away_b2b", False))
+            hs = pred.goalie_spec(g["home"], None, b2b=hb)
+            as_ = pred.goalie_spec(g["away"], None, b2b=ab)
+            r = pred.predict_game(g["home"], g["away"], hs, as_, home_b2b=hb, away_b2b=ab)
         except ValueError as e:
             print(f"  [skip] {g}: {e}")
             continue
-        new.append({"game_id": g["game_id"], "date": g["date"], "home": g["home"], "away": g["away"],
-                    "home_b2b": g.get("home_b2b", False), "away_b2b": g.get("away_b2b", False),
-                    "p_home_win": r["p_home_win"], "p_home_reg": r["p_home_reg"], "p_tie_reg": r["p_tie_reg"],
-                    "p_away_reg": r["p_away_reg"], "exp_home": r["exp_home"], "exp_away": r["exp_away"],
-                    "logged_at": datetime.now().isoformat(timespec="seconds"),
-                    "model_through": art["meta"]["trained_through"]})
+        row = {"game_id": g["game_id"], "date": g["date"], "home": g["home"], "away": g["away"],
+               "home_b2b": hb, "away_b2b": ab,
+               "p_home_win": r["p_home_win"], "p_home_reg": r["p_home_reg"], "p_tie_reg": r["p_tie_reg"],
+               "p_away_reg": r["p_away_reg"], "exp_home": r["exp_home"], "exp_away": r["exp_away"],
+               "logged_at": datetime.now().isoformat(timespec="seconds"),
+               "model_through": art["meta"]["trained_through"]}
         # totals at the two common lines
-        d = pred.predict_game(g["home"], g["away"], hs, as_, total_line=5.5, home_b2b=g.get("home_b2b", False),
-                              away_b2b=g.get("away_b2b", False))
-        new[-1]["p_over_5_5"] = d["total"]["over"]
-        new[-1]["p_over_6_5"] = r["total"]["over"]
-        new[-1]["p_home_m1_5"] = r["spread"]["cover"]
+        d = pred.predict_game(g["home"], g["away"], hs, as_, total_line=5.5, home_b2b=hb, away_b2b=ab)
+        row["p_over_5_5"] = d["total"]["over"]
+        row["p_over_6_5"] = r["total"]["over"]
+        row["p_home_m1_5"] = r["spread"]["cover"]
+        # the book's own lines, so the Track Record can grade totals and puck lines vs the market
+        row["exp_total"] = r["exp_total"]
+        row["total_line"] = np.nan if total_line is None else float(total_line)
+        row["p_over_line"] = np.nan
+        if total_line is not None:
+            row["p_over_line"] = pred.predict_game(g["home"], g["away"], hs, as_, total_line=float(total_line),
+                                                   home_b2b=hb, away_b2b=ab)["total"]["over"]
+        row["home_spread"] = np.nan if home_spread is None else float(home_spread)
+        row["p_home_cover_line"] = np.nan
+        if home_spread is not None:
+            row["p_home_cover_line"] = pred.predict_game(g["home"], g["away"], hs, as_,
+                                                         home_spread=float(home_spread), home_b2b=hb,
+                                                         away_b2b=ab)["spread"]["cover"]
+        row["confidence_k"] = art.get("confidence_k", 1.0)
+        new.append(row)
+    if skipped:
+        print(f"  prediction log: {skipped} slate games had already started - kept their pre-game rows")
     if new:
         new = pd.DataFrame(new)
         if not log.empty:
@@ -179,8 +224,28 @@ def _grade(market, side, line, home_score, away_score):
     return "win" if v > 1e-9 else ("push" if abs(v) <= 1e-9 else "loss")
 
 
+def add_clv(log):
+    """Closing-line value per side, with the book's margin taken out.
+        clv       = closing no-vig prob - opening no-vig prob (Pinnacle when it priced the side at the same
+                    line at open AND close, else Hard Rock). Positive = the market moved toward the pick.
+        price_clv = closing no-vig prob - break-even prob of the OPEN price (the old figure; includes the
+                    ~2.5-point margin, so it runs negative even when the line doesn't move).
+    Only when the line is the same at open and close."""
+    from nhl_model import american_to_decimal
+    for c in ("close_ref_fair", "open_ref_fair", "close_fair", "open_fair", "open_price", "open_line", "close_line"):
+        log[c] = pd.to_numeric(log[c], errors="coerce")
+    same_line = (log["open_line"].isna() & log["close_line"].isna()) | ((log["open_line"] - log["close_line"]).abs() < 1e-9)
+    use_ref = log["open_ref_fair"].notna() & log["close_ref_fair"].notna()
+    move = np.where(use_ref, log["close_ref_fair"] - log["open_ref_fair"], log["close_fair"] - log["open_fair"])
+    log["clv"] = np.where(same_line, move, np.nan)
+    log["clv_vs"] = np.where(same_line, np.where(use_ref, "pinnacle", "hardrock"), "")
+    breakeven = 1 / log["open_price"].map(american_to_decimal)
+    log["price_clv"] = np.where(same_line, log["close_ref_fair"].fillna(log["close_fair"]) - breakeven, np.nan)
+    return log
+
+
 def update_edge_log(art, data_dir):
-    from nhl_model import Predictor, american_to_decimal, load_data
+    from nhl_model import EDGE_FLAG, FLAG_RULE, Predictor, american_to_decimal, load_data
     pred = Predictor(art)
     log = pd.read_csv(EDGE_LOG) if EDGE_LOG.exists() else pd.DataFrame()
     key = ["game_id", "market", "side"]
@@ -191,10 +256,7 @@ def update_edge_log(art, data_dir):
     cur = []
     for g in pred.slate:
         go = pred.game_odds(g["game_id"])
-        if not go:
-            continue
-        start = pd.to_datetime(g.get("start_utc"), utc=True, errors="coerce") if g.get("start_utc") else pd.NaT
-        if pd.notna(start) and start <= now:
+        if not go or _started(g, now):
             continue
         hb, ab = g.get("home_b2b", False), g.get("away_b2b", False)
         try:
@@ -207,17 +269,21 @@ def update_edge_log(art, data_dir):
             cur.append({"game_id": int(g["game_id"]), "date": g["date"], "home": g["home"], "away": g["away"],
                         "market": r["market"], "side": r["side"], "label": r["label"], "line": r["line"],
                         "price": r["price"], "model_p": r["model_cond"], "fair": r["fair"], "edge": r["edge"],
-                        "ev": r["ev"], "ref_fair": r["ref_fair"], "logged_at": stamp})
+                        "ev": r["ev"], "ref_fair": r["ref_fair"], "logged_at": stamp, "_flag": r["flag"]})
     cur = pd.DataFrame(cur)
 
-    # 2) new sides get their "open" snapshot; every priced side gets its "close" overwritten
+    # 2) new sides get their "open" snapshot (and their flag, under the current rule); every priced side
+    #    gets its "close" overwritten
+    if not log.empty and "flag_rule" not in log.columns:
+        log["flag_rule"] = "v1"                          # rows flagged before the Pinnacle rule existed
     if not cur.empty:
         C = cur.set_index(key)
         L = log.set_index(key) if not log.empty else pd.DataFrame()
         new = C.index if L.empty else C.index.difference(L.index)
         if len(new):
             add = pd.concat([C.loc[new, ["date", "home", "away"]], C.loc[new, EDGE_FIELDS].add_prefix("open_")], axis=1)
-            add["flag"] = add["open_edge"] >= EDGE_FLAG
+            add["flag"] = C.loc[new, "_flag"].astype(bool)
+            add["flag_rule"] = FLAG_RULE
             L = add if L.empty else pd.concat([L, add])
         close = C[EDGE_FIELDS].add_prefix("close_")
         for c in close.columns:
@@ -230,14 +296,8 @@ def update_edge_log(art, data_dir):
         print("  edge log: no Hard Rock prices for upcoming games yet")
         return
 
-    # 3) closing-line value (needs the same line at open and close): the reference book's closing no-vig
-    #    probability minus the break-even probability of the open price. Positive = you beat the close.
-    for c in ("close_ref_fair", "close_fair", "open_price", "open_line", "close_line"):
-        log[c] = pd.to_numeric(log[c], errors="coerce")
-    same_line = (log["open_line"].isna() & log["close_line"].isna()) | ((log["open_line"] - log["close_line"]).abs() < 1e-9)
-    breakeven = 1 / log["open_price"].map(american_to_decimal)
-    log["clv"] = np.where(same_line, log["close_ref_fair"].fillna(log["close_fair"]) - breakeven, np.nan)
-    log["clv_vs"] = np.where(same_line, np.where(log["close_ref_fair"].notna(), "pinnacle", "hardrock"), "")
+    # 3) closing-line value, margin removed
+    log = add_clv(log)
 
     # 4) settle finished games at the OPEN price (1 unit staked)
     for c in ("result", "profit", "final"):
@@ -254,17 +314,21 @@ def update_edge_log(art, data_dir):
         log.at[i, "profit"] = round(dec - 1, 4) if res == "win" else (0.0 if res == "push" else -1.0)
         log.at[i, "final"] = f"{int(f['away_score'])}-{int(f['home_score'])}"
 
-    order = ["game_id", "date", "away", "home", "market", "side", "flag"] + [f"open_{c}" for c in EDGE_FIELDS] \
-        + [f"close_{c}" for c in EDGE_FIELDS] + ["clv", "clv_vs", "result", "profit", "final"]
+    order = ["game_id", "date", "away", "home", "market", "side", "flag", "flag_rule"] \
+        + [f"open_{c}" for c in EDGE_FIELDS] + [f"close_{c}" for c in EDGE_FIELDS] \
+        + ["clv", "clv_vs", "price_clv", "result", "profit", "final"]
     log = log[[c for c in order if c in log.columns]].sort_values(["date", "game_id", "market", "side"])
     EDGE_LOG.parent.mkdir(exist_ok=True)
     log.to_csv(EDGE_LOG, index=False)
     flag = log[log["flag"].astype(str).str.lower() == "true"]
-    settled = flag[flag["result"].notna()]
-    rec = settled["result"].value_counts()
-    print(f"  edge log: {len(log)} sides | {len(flag)} flagged (edge >= {100 * EDGE_FLAG:.0f} pts) | settled flagged: "
-          f"{rec.get('win', 0)}-{rec.get('loss', 0)}-{rec.get('push', 0)}, "
-          f"{pd.to_numeric(settled['profit']).sum():+.2f} units -> {EDGE_LOG.relative_to(ROOT)}")
+    for rule, fr in flag.groupby("flag_rule"):
+        settled = fr[fr["result"].notna()]
+        rec = settled["result"].value_counts()
+        print(f"  edge log [{rule}]: {len(fr)} flagged | settled {rec.get('win', 0)}-{rec.get('loss', 0)}-"
+              f"{rec.get('push', 0)}, {pd.to_numeric(settled['profit']).sum():+.2f} units, "
+              f"avg CLV {100 * pd.to_numeric(fr['clv']).mean():+.2f} pts")
+    print(f"  edge log: {len(log)} sides (flag = edge >= {100 * EDGE_FLAG:.0f} pts + Pinnacle agrees) "
+          f"-> {EDGE_LOG.relative_to(ROOT)}")
 
 
 def backtest_summary(data_dir, **kw):
@@ -281,14 +345,29 @@ def backtest_summary(data_dir, **kw):
     return r
 
 
+def tune_confidence_k(data_dir, settings, ks=(1.0, 1.1, 1.2, 1.3, 1.4)):
+    """Walk-forward each confidence_k and print moneyline / 3-way / puck-line scores, per season too."""
+    from nhl_model import load_data, walk_forward
+    D = load_data(data_dir, log=lambda *a: None)
+    base = {k: v for k, v in settings.items() if k != "confidence_k"}
+    print(f"{'k':>5} {'ML logloss':>11} {'ML Brier':>9} {'3-way LL':>9} {'PL Brier':>9}   ML logloss by season")
+    for k in ks:
+        r = walk_forward(data_dir, n_seasons=4, confidence_k=k, D=D, log=lambda *a: None, **base)
+        seas = "  ".join(f"{s[2:4]}-{s[6:]} {v['win_logloss']:.4f}" for s, v in r["by_season"].items())
+        print(f"{k:5.2f} {r['win_logloss']:11.5f} {r['win_brier']:9.5f} {r['reg3_logloss']:9.5f} "
+              f"{r['pl_brier']:9.5f}   {seas}")
+    print("Lower is better. Set the winner with --confidence-k, or as DEFAULT_CONFIDENCE_K in nhl_model.py.")
+
+
 def main():
     from nhl_model import (DEFAULT_ALPHA, DEFAULT_CARRYOVER, DEFAULT_HALF_LIFE, DEFAULT_SHOT_BLEND,
-                           DEFAULT_XG_BLEND, DEFAULT_GOALIE_XG_BLEND)
+                           DEFAULT_XG_BLEND, DEFAULT_GOALIE_XG_BLEND, DEFAULT_CONFIDENCE_K)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--skip-fetch", action="store_true", help="don't call the NHL API; retrain from existing data/")
     ap.add_argument("--days-back", type=int, default=3, help="days to sweep for newly finished games (default 3)")
     ap.add_argument("--push", action="store_true", help="git commit + push the model and data files when done")
     ap.add_argument("--backtest", action="store_true", help="run the walk-forward backtest and store its scores")
+    ap.add_argument("--tune-k", action="store_true", help="walk-forward the confidence adjustment and exit")
     ap.add_argument("--half-life", type=float, default=DEFAULT_HALF_LIFE, help="recency half-life (days)")
     ap.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, help="ridge strength")
     ap.add_argument("--carryover", type=float, default=DEFAULT_CARRYOVER, help="weight per past season (1 = off)")
@@ -296,8 +375,18 @@ def main():
     ap.add_argument("--xg-blend", type=float, default=DEFAULT_XG_BLEND, help="share of ratings from xG model")
     ap.add_argument("--goalie-xg-blend", type=float, default=DEFAULT_GOALIE_XG_BLEND,
                     help="share of goalie ratings from GSAx instead of save%% (0-1)")
+    ap.add_argument("--confidence-k", type=float, default=DEFAULT_CONFIDENCE_K,
+                    help="confidence adjustment on home/away goal rates (1 = off)")
     ap.add_argument("--no-odds", action="store_true", help="don't pull sportsbook odds this run")
     args = ap.parse_args()
+
+    sys.path.insert(0, str(ROOT))
+    settings = dict(half_life_days=args.half_life, alpha=args.alpha, carryover=args.carryover,
+                    shot_blend=args.shot_blend, xg_blend=args.xg_blend, goalie_xg_blend=args.goalie_xg_blend,
+                    confidence_k=args.confidence_k)
+    if args.tune_k:
+        tune_confidence_k(ROOT / "data", settings)
+        return
 
     py = sys.executable
     if not args.skip_fetch:
@@ -311,7 +400,6 @@ def main():
         for i, (cmd, label) in enumerate(steps, 1):
             run(cmd, f"{i}/{len(steps)} {label}")
 
-    sys.path.insert(0, str(ROOT))
     if not args.no_odds:
         print("\n=== Sportsbook odds (Hard Rock Bet FL + Pinnacle) ===")
         try:
@@ -323,8 +411,6 @@ def main():
     upcoming = json.loads(UPCOMING.read_text()) if UPCOMING.exists() else []
     print("\n=== Retrain model ===")
     from nhl_model import load_artifact, save_artifact, train_artifact
-    settings = dict(half_life_days=args.half_life, alpha=args.alpha, carryover=args.carryover,
-                    shot_blend=args.shot_blend, xg_blend=args.xg_blend, goalie_xg_blend=args.goalie_xg_blend)
     art = train_artifact(ROOT / "data", upcoming=upcoming, log=lambda *a: print(" ", *a), **settings)
     try:
         import nhl_odds
@@ -354,7 +440,7 @@ def main():
         save_artifact(art, ARTIFACT)
         print(f"\nSaved {ARTIFACT.relative_to(ROOT)}  |  trained through {m['trained_through']}  |  "
               f"goalies {'ON' if m['goalies_on'] else 'OFF'}  |  xG blend {m.get('xg_blend_used', 0):g}  |  "
-              f"goalie GSAx blend {m.get('goalie_xg_blend_used', 0):g}  |  "
+              f"goalie GSAx blend {m.get('goalie_xg_blend_used', 0):g}  |  confidence k {m.get('confidence_k', 1):g}  |  "
               f"{len(art['slate'])} upcoming games")
 
     print("\n=== Prediction log ===")
@@ -370,6 +456,7 @@ def main():
         publish(f"Update model through {m['trained_through']}")
     else:
         print("\nTo publish: python refresh.py --skip-fetch --push   (or git add/commit/push the model/ and data/ files)")
+
 
 if __name__ == "__main__":
     main()
