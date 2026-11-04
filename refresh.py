@@ -57,6 +57,7 @@ ARTIFACT = ROOT / "model" / "model_artifact.json"
 PRED_LOG = ROOT / "model" / "prediction_log.csv"
 XG_PARAMS = ROOT / "model" / "xg_params.json"
 EDGE_LOG = ROOT / "model" / "edge_log.csv"
+STARTER_CALIB = ROOT / "model" / "starter_calibration.json"
 UPCOMING = ROOT / "data" / "upcoming.json"
 LOCAL_ONLY = {"shots.parquet", "shot_xg.parquet"}   # too big to commit twice a day; never pushed
 VOLATILE_META = {"fitted_at", "as_of"}
@@ -83,7 +84,7 @@ def git(*args, check=True, capture=False):
 
 def published_files():
     """Model files + the data the next refresh needs (minus the big shot-level files)."""
-    files = [ARTIFACT, PRED_LOG, EDGE_LOG, XG_PARAMS, UPCOMING]
+    files = [ARTIFACT, PRED_LOG, EDGE_LOG, XG_PARAMS, UPCOMING, STARTER_CALIB]
     files += sorted(p for p in (ROOT / "data").glob("*.parquet") if p.name not in LOCAL_ONLY)
     return [p for p in files if p.exists()]
 
@@ -412,6 +413,15 @@ def main():
     print("\n=== Retrain model ===")
     from nhl_model import load_artifact, save_artifact, train_artifact
     art = train_artifact(ROOT / "data", upcoming=upcoming, log=lambda *a: print(" ", *a), **settings)
+    try:                              # projected starters: shown in the app (probabilities use the usual mix)
+        import nhl_starters
+        art["starters"] = nhl_starters.project_slate(nhl_starters.load_goalies(ROOT / "data"), art["slate"],
+                                                     log=lambda *a: print(" ", *a))
+        n = sum(len(v) for v in art["starters"].values())
+        print(f"  projected starters for {n} team-games")
+    except Exception as e:
+        print(f"  [warn] starter projections skipped: {e}")
+        art["starters"] = {}
     try:
         import nhl_odds
         art["odds"] = nhl_odds.latest_block([g["game_id"] for g in art["slate"]])

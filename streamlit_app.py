@@ -393,7 +393,7 @@ with tab_slate:
                                    format_func=day_label, key="sl_day")
         rows = [c for c in cards if c["g"]["date"] == (day or dates[0])]
         st.caption(f"{len(rows)} games · projections are final scores including OT/SO, with each team's usual goalie "
-                   f"mix · lines: {BOOK}")
+                   f"mix · 🥅 = projected starter (chance he starts) · lines: {BOOK}")
         cols = st.columns(2)
         for i, c in enumerate(rows):
             g, r, bk = c["g"], c["r"], c["book"]
@@ -405,9 +405,13 @@ with tab_slate:
             ml, sp, tt = bk.get("h2h") or {}, bk.get("spreads") or {}, bk.get("totals") or {}
             start = (bk.get("commence_time") if bk else None) or g.get("start_utc")
 
-            # likeliest starter per team, from the usual-mix weights
+            # projected starter per team (nhl_starters.py); falls back to the likeliest goalie in the usual mix
             gl = []
             for t in (a, h):
+                pj = pred.projected_starter(g["game_id"], t)
+                if pj:
+                    gl.append(f'{t}: {pj["name"]} <span class="muted">({pj["p_start"]:.0%}, {pj["confidence"]})</span>')
+                    continue
                 opts = [x for x in (r.get("goalie_info") or []) if x["team"] == t]
                 if opts:
                     top = max(opts, key=lambda x: x["prob"])
@@ -490,8 +494,16 @@ def render_game_tab():
                     away_gid, away_conf = gid, conf
                 else:
                     home_gid, home_conf = gid, conf
-            st.caption("Pick a starter once he's confirmed (typically morning of the game). 'Unknown' uses each team's "
-                       "recent starter mix, shifted toward the backup on the second night of a back-to-back.")
+            if sg:
+                pjs = [(t, pred.projected_starter(sg["game_id"], t)) for t in (away, home)]
+                pjs = [f"**{t}** {pj['name']} ({pj['p_start']:.0%}, {pj['confidence']}) - {pj['reason']}"
+                       for t, pj in pjs if pj]
+                if pjs:
+                    st.markdown("Projected starters: " + " · ".join(pjs))
+            st.caption("Pick a starter once he's confirmed (typically after morning skate). 'Unknown' uses the "
+                       "team's usual mix among goalies still with the team, shifted toward the backup on the second "
+                       "night of a back-to-back. Projections are a guide only - in testing they didn't make the "
+                       "probabilities more accurate than the usual mix; a confirmed starter does.")
 
     # ---- lines ----
     with st.expander("Lines", expanded=True):

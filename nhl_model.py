@@ -587,10 +587,17 @@ def train_artifact(data_dir="data", half_life_days=DEFAULT_HALF_LIFE, alpha=DEFA
         table = t.reset_index()[cols]
         table["last_game"] = table["last_game"].dt.strftime("%Y-%m-%d")
         st = g[g["starter"]].drop_duplicates(["game_id", "team"])
+        # Usual mix = start shares among goalies who are still AVAILABLE to the team (dressed for it in one
+        # of its last 3 games within 45 days, and it's the last team they dressed for) - so traded, sent-down,
+        # injured and departed goalies drop out. Walk-forward 2023-26: moneyline log-loss 0.67045 -> 0.66997
+        # (p = 0.03) vs the old last-25-starts mix; feeding projected starters on top added nothing.
+        import nhl_starters as ns
+        state = ns.build_state(g)
         pools, last_starter = {}, {}
         for tm in teams:
-            r = st[st["team"] == tm].tail(pool_starts)
-            pools[tm] = r["player_id"].value_counts(normalize=True).to_dict() if len(r) else {}
+            avail, hist = ns.available(state, tm, as_of)
+            pools[tm] = {int(k): float(v) for k, v in avail.items()}
+            r = st[st["team"] == tm]
             if len(r):
                 last_starter[tm] = {"player_id": int(r["player_id"].iloc[-1]),
                                     "date": r["game_date"].iloc[-1].strftime("%Y-%m-%d")}
@@ -768,6 +775,7 @@ class Predictor:
         self.period_shares = {t: {int(k): v for k, v in s.items()} for t, s in art["period_shares"].items()}
         self.slate = art.get("slate", [])
         self.odds = art.get("odds") or {}
+        self.starters = art.get("starters") or {}        # {game_id: {team: projection}} from nhl_starters.py
         gb = art.get("goalies")
         self.goalies_on = bool(gb)
         if self.goalies_on:
@@ -777,6 +785,11 @@ class Predictor:
             self.b2b_same = gb.get("b2b_same_goalie", 0.2)
 
     # ---------- goalies ----------
+    def projected_starter(self, game_id, team):
+        """nhl_starters.py projection for one team in one slate game ({name, p_start, confidence, reason, ...})
+        or None. Shown in the app; the win probabilities use the usual mix (projections didn't add accuracy)."""
+        return (self.starters.get(str(game_id)) or {}).get(self.aliases.get(team, team))
+
     def goalie_options(self, team, max_age_days=400):
         if not self.goalies_on:
             return []
@@ -808,6 +821,8 @@ class Predictor:
         if not ls or not pool:
             return None
         pid = int(ls["player_id"])
+        if pid not in pool:                  # last night's starter is no longer available: plain usual mix
+            return None
         others = {k: v for k, v in pool.items() if k != pid}
         tot = sum(others.values())
         if tot <= 0:
