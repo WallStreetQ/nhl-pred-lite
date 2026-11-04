@@ -71,7 +71,7 @@ jobs:
         run: |
           missing=0
           for f in refresh.py nhl_model.py goalie_features.py nhl_common.py nhl_update.py nhl_periods.py \
-                   nhl_goalies.py nhl_schedule.py data/games.parquet data/game_periods.parquet data/game_goalies.parquet; do
+                   nhl_goalies.py nhl_schedule.py nhl_starters.py data/games.parquet data/game_periods.parquet data/game_goalies.parquet; do
             if [ ! -f "$f" ]; then echo "::error::Missing from the repo: $f"; missing=1; fi
           done
           if [ ! -f nhl_odds.py ]; then echo "::warning::nhl_odds.py not in the repo - no sportsbook odds or edge log"; fi
