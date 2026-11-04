@@ -1,13 +1,24 @@
-# Daily refresh: runs refresh.py on GitHub so you don't have to. (Same pattern as the NBA repo.)
+# Daily refresh: runs refresh.py on GitHub so you don't have to.
+# This file must live in the repo at  .github/workflows/daily-refresh.yml  on the DEFAULT branch
+# (scheduled workflows never run from any other path or branch).
 #
-#   ~10 AM ET   full refresh: last night's results, periods, goalies, shots/xG, schedule, retrain,
-#               opening odds, prediction + edge logs
-#   ~6 PM ET    closing odds before puck drop (refresh.py --skip-fetch: no data fetch)
+#   morning  full refresh: last night's results, periods, goalies, shots/xG, schedule, retrain,
+#            opening odds, prediction + edge logs
+#   evening  closing odds before puck drop (refresh.py --skip-fetch: no data fetch)
 #
-# GitHub schedules are in UTC, so each run lands an hour earlier in winter (EST) than in summer (EDT).
-# Minutes are set off the hour on purpose: runs scheduled on the hour start late most often.
+# TIMING: GitHub's own scheduler has been starting these runs 3-6 HOURS late (Oct 21 - Nov 3: morning runs
+# began 1:30-3:30 PM ET, evening runs 9-11 PM ET, after most puck drops). So:
+#   1. The reliable trigger is an outside scheduler (e.g. cron-job.org) calling this workflow's
+#      workflow_dispatch endpoint at 9:00 AM and 5:30 PM ET - it starts within a minute. See DEPLOY.md.
+#   2. The cron lines below are BACKUPS, set early so that even 3-5 hours late they land near the right time.
+#      Extra runs are harmless: refresh.py only commits when something changed, games that have started are
+#      never re-logged, and the concurrency group runs them one at a time.
+# Cron times are UTC (ET = UTC-5 in winter, UTC-4 in summer).
 # refresh.py --push commits model/ and data/*.parquet (Streamlit redeploys about a minute later) and
 # rebases + retries by itself if you pushed from VS Code in the meantime.
+#
+# If a run fails, the last step opens (or comments on) a GitHub issue titled "Daily refresh failing",
+# so you get an email and the failure can't go unnoticed. Close the issue once it's fixed.
 #
 # The two shot-level files (data/shots.parquet, data/shot_xg.parquet) are too big to commit twice a day,
 # so they live in this workflow's cache instead. The very first run has no cache yet and backfills them
@@ -17,8 +28,10 @@ name: Daily refresh
 
 on:
   schedule:
-    - cron: "7 14 * * *"     # 10:07 AM EDT / 9:07 AM EST  (morning)
-    - cron: "7 22 * * *"     # 6:07 PM EDT / 5:07 PM EST   (evening)
+    - cron: "7 11 * * *"     # morning backup: 6:07 AM EST, typically lands ~9-11 AM with GitHub's delay
+    - cron: "7 14 * * *"     # morning backup: 9:07 AM EST
+    - cron: "37 19 * * *"    # evening backup: 2:37 PM EST, typically lands ~5-7 PM
+    - cron: "7 22 * * *"     # evening backup: 5:07 PM EST (catches late West Coast lines when delayed)
   workflow_dispatch:         # run it by hand: Actions -> Daily refresh -> Run workflow
     inputs:
       mode:
@@ -32,7 +45,8 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: write            # push the refreshed model/data
+  issues: write              # open an issue when a run fails
 
 jobs:
   refresh:
@@ -40,7 +54,8 @@ jobs:
     timeout-minutes: 120     # only the first run (shot backfill) needs this long
     env:
       ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
-      MODE: ${{ github.event.inputs.mode || (github.event.schedule == '7 22 * * *' && 'evening' || 'morning') }}
+      MODE: ${{ github.event.inputs.mode || ((github.event.schedule == '7 22 * * *' || github.event.schedule == '37 19 * * *') && 'evening' || 'morning') }}
+      TZ: America/New_York   # logged_at timestamps in ET, same as runs from your computer
     steps:
       - uses: actions/checkout@v4
 
@@ -51,6 +66,24 @@ jobs:
 
       - name: Install
         run: pip install -r requirements.txt pyarrow requests
+
+      - name: Preflight - required files and settings
+        run: |
+          missing=0
+          for f in refresh.py nhl_model.py goalie_features.py nhl_common.py nhl_update.py nhl_periods.py \
+                   nhl_goalies.py nhl_schedule.py data/games.parquet data/game_periods.parquet data/game_goalies.parquet; do
+            if [ ! -f "$f" ]; then echo "::error::Missing from the repo: $f"; missing=1; fi
+          done
+          if [ ! -f nhl_odds.py ]; then echo "::warning::nhl_odds.py not in the repo - no sportsbook odds or edge log"; fi
+          if [ -z "$ODDS_API_KEY" ]; then echo "::warning::ODDS_API_KEY secret is not set - no sportsbook odds or edge log"; fi
+          if [ -f model/xg_params.json ] && [ ! -f nhl_shots.py -o ! -f nhl_xg.py ]; then
+            echo "::error::model/xg_params.json is committed, so refresh.py will run nhl_shots.py and nhl_xg.py - commit both"; missing=1
+          fi
+          if git check-ignore -q data/games.parquet; then
+            echo "::error::.gitignore ignores data/*.parquet, so refresh.py --push can't publish the data the next run needs"; missing=1
+          fi
+          echo "Mode: $MODE | data/games.parquet last commit: $(git log -1 --format='%ad' --date=iso -- data/games.parquet)"
+          exit $missing
 
       - name: Git identity
         run: |
@@ -75,6 +108,14 @@ jobs:
             python refresh.py --push
           fi
 
+      - name: Run summary
+        if: always()
+        run: |
+          echo "### Daily refresh ($MODE)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f model/prediction_log.csv ]; then
+            python -c "import pandas as pd; L = pd.read_csv('model/prediction_log.csv'); s = L[L['home_score'].notna()]; print(f'- prediction log: {len(L)} games, {len(s)} settled, latest settled {s.date.max()}, last logged {L.logged_at.max()}')" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Save shot data
         if: always() && env.MODE == 'morning'    # also after a failure, so a partial backfill isn't lost
         uses: actions/cache/save@v4
@@ -83,3 +124,17 @@ jobs:
             data/shots.parquet
             data/shot_xg.parquet
           key: nhl-shots-${{ github.run_id }}
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          n=$(gh issue list --state open --search "Daily refresh failing in:title" --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+            gh issue comment "$n" --body "Failed again ($MODE run): $url"
+          else
+            gh issue create --title "Daily refresh failing" \
+              --body "The $MODE refresh failed: $url. Open the run, expand the red step, and fix the first error."
+          fi
